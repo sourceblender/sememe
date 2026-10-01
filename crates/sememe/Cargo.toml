@@ -1,0 +1,11 @@
+[package]
+name = "sememe"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Debug harness for text-encoder models."
+publish = false
+
+[dependencies]
+thiserror = { workspace = true }

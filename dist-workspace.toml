@@ -1,0 +1,28 @@
+# Release automation: https://opensource.axo.dev/cargo-dist/
+# Pushing a `vX.Y.Z` tag builds the CLI for every target below, attaches
+# archives + checksums + installers to a GitHub Release, and publishes the
+# crates (.github/workflows/publish-crates.yml).
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.33.0"
+ci = "github"
+installers = ["shell", "powershell"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+install-path = "CARGO_HOME"
+# Build only distributable packages with `-p` instead of `--workspace`.
+precise-builds = true
+publish-jobs = ["./publish-crates"]
+# A reusable workflow may only use permissions its caller grants; the
+# publish job just needs to read the repository.
+github-custom-job-permissions = { "publish-crates" = { contents = "read" } }
+# Run the release plan on PRs, without building.
+pr-run-mode = "plan"
+# release.yml is hand-edited after generation; don't fail the plan over that.
+allow-dirty = ["ci"]

@@ -1,0 +1,15 @@
+[package]
+name = "sememe-cli"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "sememe command-line interface."
+publish = false
+
+[[bin]]
+name = "sememe"
+path = "src/main.rs"
+
+[dependencies]
+sememe = { path = "../../crates/sememe" }

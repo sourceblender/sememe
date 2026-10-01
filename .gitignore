@@ -1,0 +1,21 @@
+# Rust / cargo
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Tooling caches
+__pycache__/
+.prettier-cache/
+.bun/
+
+# Generated trainer outputs (see scripts/regenerate-examples.sh for the tracked ones)
+/tokenizer.json
+# Downloaded HF tokenizer fixtures (scripts/fetch-hf-fixtures.sh)
+crates/sememe/tests/data/
+.pytest_cache/

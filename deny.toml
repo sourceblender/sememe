@@ -1,0 +1,42 @@
+# cargo-deny configuration (`cargo deny check`, run in CI).
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Permissive licenses only, listing exactly what the dependency tree uses.
+# Unicode-3.0 covers Unicode data tables. ISC, BSD-3-Clause and
+# CDLA-Permissive-2.0 (Mozilla's root certificates) come from the rustls
+# TLS stack used by the (not yet added) PyTorch bridge.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "ISC",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+# `target-lexicon` is a build-time dependency of `pyo3-build-config` (the
+# Python bindings in `bindings/python`). Its license is Apache-2.0 plus the
+# LLVM exception, which only relaxes Apache-2.0's binary-attribution terms;
+# allow it for this one crate rather than globally.
+exceptions = [
+    { name = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-exception"] },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

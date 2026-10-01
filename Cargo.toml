@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sememe",
+    "apps/sememe-cli",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/sourceblender/sememe"
+authors = ["The sememe authors"]
+
+[workspace.dependencies]
+thiserror = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Profile used by `dist` for release binaries.
+[profile.dist]
+inherits = "release"
