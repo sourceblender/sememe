@@ -7,14 +7,18 @@ run in mock mode without the optional model dependencies installed.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import hashlib
+import json
 import math
 import threading
 import time
 from pathlib import Path
-from typing import Callable
-from typing import Any
+from typing import Any, Callable
 
-from .api import EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, TensorInfo, TensorStats
+from .api import (MAX_INPUT_TOKENS_CEILING, MAX_PROMPT_CHARS, MAX_TOP_K, Candidate, EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, RunFailed,
+                  RunResult, RunSettings, TensorInfo, TensorStats, Token)
+from ..records import new_run_id, write_record
 
 
 class TorchEngine:
@@ -25,6 +29,9 @@ class TorchEngine:
         self._modules: dict[str, Any] = {}
         self._info: ModelInfo | None = None
         self._torch: Any | None = None
+        self._full: Any | None = None  # the task model with its output head, when runnable
+        self._tokenizer: Any | None = None
+        self._identity: dict = {}
 
     def load(self, model: str | Path, progress: Progress | None = None,
              cancelled: Callable[[], bool] | None = None) -> ModelInfo:
@@ -52,6 +59,7 @@ class TorchEngine:
             emit(LoadEvent("import", "importing torch and transformers", clock()))
             try:
                 import torch
+                import transformers
                 from transformers import AutoConfig, AutoModel
             except ImportError as exc:
                 raise EngineError(
@@ -77,11 +85,34 @@ class TorchEngine:
             with _install_events(check, lambda done, total, name: emit(LoadEvent(
                     "install", "parameters installed", clock(), done=done, total=total,
                     unit="parameters", item=name, finished=done == total))) as seen:
-                loaded = AutoModel.from_pretrained(identifier, config=config, dtype="auto", trust_remote_code=False)
+                # The task model (with its output head) when transformers knows the
+                # architecture; otherwise the base model, which can be inspected
+                # but not run. Inspection always looks at the base model, so
+                # module addresses are the same either way.
+                full_cls = _task_class(transformers, config)
+                full = (full_cls or AutoModel).from_pretrained(identifier, config=config, dtype="auto",
+                                                               trust_remote_code=False)
             if not seen:
                 emit(LoadEvent("install", "weights installed (this transformers version reports no per-parameter "
                                "events)", clock(), finished=True))
-            loaded.eval()
+            full.eval()
+            loaded = _base_of(full)
+
+            phase = "tokenizer"
+            check()
+            emit(LoadEvent("tokenizer", "loading tokenizer", clock()))
+            tokenizer = None
+            tokenizer_note = "no tokenizer: this transformers build has no AutoTokenizer"
+            auto_tokenizer = getattr(transformers, "AutoTokenizer", None)
+            if full_cls is None:
+                tokenizer_note = "no output head for this architecture, so the model can be inspected but not run"
+            elif auto_tokenizer is not None:
+                try:
+                    tokenizer = auto_tokenizer.from_pretrained(identifier, trust_remote_code=False)
+                    tokenizer_note = f"tokenizer loaded: {type(tokenizer).__name__}"
+                except Exception as exc:  # a model without a tokenizer is still inspectable
+                    tokenizer_note = f"no tokenizer ({exc}); the model can be inspected but not run"
+            emit(LoadEvent("tokenizer", tokenizer_note, clock(), finished=True))
 
             phase = "inspect"
             emit(LoadEvent("inspect", "enumerating modules", clock()))
@@ -115,13 +146,137 @@ class TorchEngine:
         # Publish a complete snapshot only after loading and enumeration succeed.
         self._torch = torch
         self._model = loaded
+        self._full = full if full_cls is not None else None
+        self._tokenizer = tokenizer
+        self._identity = _identity(identifier, full, config, torch, transformers)
         self._modules = modules
         self._info = info
         return info
 
+    def run(self, prompt: str, settings: RunSettings,
+            cancelled: Callable[[], bool] | None = None) -> RunResult:
+        """One forward pass over `prompt`, scored at the final position.
+
+        Every attempt gets a run id at its start and a record, whatever its
+        outcome. A forward already executing cannot be interrupted: `cancelled`
+        is checked before tokenizing, before the forward, and after it (a run
+        cancelled after its forward is recorded as cancelled, without a result).
+        Raises RunFailed for anything that does not produce a result."""
+        run_id = new_run_id()
+        stop = cancelled or (lambda: False)
+        # Local references: a Close or a new load may clear the engine's fields
+        # while this forward runs; the run keeps using the model it started with.
+        full, tokenizer, torch, identity = self._full, self._tokenizer, self._torch, dict(self._identity)
+        timing: dict[str, float] = {}
+        attempt = {"run_id": run_id, "settings": dataclasses.asdict(settings), "model": identity,
+                   "timing": timing, "tokens": [], "candidates": [], "used": {}, **_bounded_prompt(prompt)}
+
+        def fail(message: str, status: str, phase: str) -> RunFailed:
+            try:
+                path = str(write_record(attempt, status=status, error=message, phase=phase))
+                return RunFailed(message, run_id, status, path)
+            except (OSError, ValueError) as exc:
+                return RunFailed(message, run_id, status, None, f"record not saved: {exc}")
+
+        if full is None or tokenizer is None or torch is None:
+            raise fail("This model can be inspected but not run: it has no next-token head or no tokenizer.",
+                       "rejected", "setup")
+        if not prompt:
+            raise fail("Type a prompt to run.", "rejected", "input")
+        if not 1 <= settings.top_k <= MAX_TOP_K:
+            raise fail(f"top_k must be between 1 and {MAX_TOP_K}; got {settings.top_k}.", "rejected", "input")
+        if not 1 <= settings.max_input_tokens <= MAX_INPUT_TOKENS_CEILING:
+            raise fail(f"max_input_tokens must be between 1 and {MAX_INPUT_TOKENS_CEILING:,}; "
+                       f"got {settings.max_input_tokens:,}.", "rejected", "input")
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise fail(f"The prompt is {len(prompt):,} characters; the limit is {MAX_PROMPT_CHARS:,}. "
+                       "It was not tokenized and nothing ran.", "rejected", "input")
+        if stop():
+            raise fail("cancelled before tokenizing", "cancelled", "tokenize")
+        t0 = time.monotonic()
+        try:
+            encoded = tokenizer(prompt, return_tensors="pt")
+        except Exception as exc:
+            raise fail(f"tokenizing failed: {exc}", "failed", "tokenize") from exc
+        ids = encoded["input_ids"]
+        timing["tokenize"] = time.monotonic() - t0
+        count = int(ids.shape[-1])
+        attempt["token_count"] = count
+        if count == 0:
+            raise fail("The prompt tokenized to zero tokens.", "rejected", "input")
+        if count > settings.max_input_tokens:
+            # Counted before decoding anything; the record keeps an excerpt only.
+            head = ids[0][:RECORD_TOKEN_EXCERPT]
+            attempt["tokens"] = [{"id": int(i), "text": tokenizer.decode([int(i)])} for i in head]
+            attempt["tokens_truncated"] = True
+            raise fail(f"The prompt is {count:,} tokens; the limit for one run is {settings.max_input_tokens:,}. "
+                       "Nothing was truncated and nothing ran.", "rejected", "input")
+        tokens = tuple(Token(int(i), tokenizer.decode([int(i)])) for i in ids[0])
+        attempt["tokens"] = [{"id": t.id, "text": t.text} for t in tokens]
+        device = next(full.parameters()).device
+        # Only the last position is scored and nothing is generated, so ask for
+        # exactly that where the model's forward supports it.
+        forward_kwargs: dict[str, Any] = {"use_cache": False}
+        if "logits_to_keep" in _forward_params(full):
+            forward_kwargs["logits_to_keep"] = 1
+        attempt["used"] = {"device": str(device), **forward_kwargs}
+        if stop():
+            raise fail("cancelled before the forward pass", "cancelled", "forward")
+        t0 = time.monotonic()
+        try:
+            with torch.inference_mode():
+                logits = full(**{k: v.to(device) for k, v in encoded.items()}, **forward_kwargs).logits
+        except Exception as exc:
+            timing["forward"] = time.monotonic() - t0
+            raise fail(f"forward failed: {exc}", "failed", "forward") from exc
+        timing["forward"] = time.monotonic() - t0
+        if stop():
+            raise fail("cancelled after the forward pass; the result was discarded", "cancelled", "forward")
+        t0 = time.monotonic()
+        try:
+            last = logits[0, -1].float()
+            if not bool(torch.isfinite(last).all()):
+                bad = int((~torch.isfinite(last)).sum())
+                raise fail(f"the model produced {bad:,} non-finite logits at the final position; no probabilities "
+                           "can be computed", "failed", "score")
+            probs = torch.softmax(last, dim=-1)
+            if not bool(torch.isfinite(probs).all()):
+                raise fail("the softmax over the final position is not finite", "failed", "score")
+            top_p, top_i = torch.topk(probs, min(settings.top_k, probs.shape[-1]))
+            candidates = tuple(Candidate(int(i), tokenizer.decode([int(i)]), float(p), float(last[int(i)]))
+                               for p, i in zip(top_p, top_i))
+        except RunFailed:
+            raise
+        except Exception as exc:  # malformed logits, a decode error: recorded, never an unrecorded escape
+            timing["score"] = time.monotonic() - t0
+            raise fail(f"scoring failed: {exc}", "failed", "score") from exc
+        timing["score"] = time.monotonic() - t0
+        used = {
+            "device": str(device),
+            "dtype": str(logits.dtype).removeprefix("torch."),
+            "scored_dtype": "float32",
+            "position": count - 1,
+            "input_tokens": count,
+            "logits_positions": int(logits.shape[1]),
+            **forward_kwargs,
+            "tokenizer": type(tokenizer).__name__,
+            "add_special_tokens": True,
+            "chat_template": False,
+            "vocab_size": int(probs.shape[-1]),
+            "top_k": len(candidates),
+        }
+        result = RunResult(run_id=run_id, prompt=prompt, tokens=tokens, candidates=candidates,
+                           settings=settings, used=used, model=identity, timing=timing)
+        try:
+            return dataclasses.replace(result, record_path=str(write_record(result)))
+        except (OSError, ValueError) as exc:
+            return dataclasses.replace(result, record_error=f"record not saved: {exc}")
+
     def close(self) -> None:
         """Drop every reference to the model so its memory can be freed."""
         self._model = None
+        self._full = None
+        self._tokenizer = None
         self._modules = {}
         self._info = None
 
@@ -261,3 +416,89 @@ def _install_events(check, report):
             yield seen
         finally:
             loading.tqdm = original
+
+
+def _task_class(transformers, config):
+    """The class named by the config's architectures, if transformers has it and
+    it carries an output head. None means: inspect only."""
+    for name in getattr(config, "architectures", None) or ():
+        cls = getattr(transformers, name, None)
+        # Only heads that score the next token. Classification, masked-LM and
+        # other heads load for inspection only.
+        if cls is not None and name.endswith(NEXT_TOKEN_HEADS):
+            return cls
+    return None
+
+
+NEXT_TOKEN_HEADS = ("ForCausalLM", "ForConditionalGeneration")
+
+
+def _forward_params(model) -> set:
+    import inspect
+    try:
+        return set(inspect.signature(model.forward).parameters)
+    except (TypeError, ValueError):
+        return set()
+
+
+def _base_of(full):
+    """The base model inside a task model (`.model`), so inspected addresses match
+    what the base class alone reports. Falls back to the model itself."""
+    base = getattr(full, "model", None)
+    return base if base is not None and hasattr(base, "named_modules") else full
+
+
+def _identity(identifier, full, config, torch, transformers) -> dict:
+    """Enough to tell later whether a record or setup belongs to these weights.
+
+    `config_sha256` identifies the configuration only: two fine-tunes of one base
+    share it. Weights are identified by the resolved snapshot revision (Hub or
+    cache), or for another local folder by its weight files' names, sizes and
+    modification times, which is explicitly not a content hash."""
+    try:
+        config_json = config.to_json_string(use_diff=False)
+    except Exception:
+        config_json = json.dumps(getattr(config, "__dict__", {}), default=str, sort_keys=True)
+    identity = {
+        "ref": identifier,
+        "class": type(full).__name__,
+        "config_sha256": hashlib.sha256(config_json.encode()).hexdigest(),
+        "config_sha256_scope": "configuration only; does not identify weights",
+        "torch": getattr(torch, "__version__", "?"),
+        "transformers": getattr(transformers, "__version__", "?"),
+    }
+    path = Path(identifier).expanduser()
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part.startswith("models--") and i + 2 < len(parts) and parts[i + 1] == "snapshots":
+            identity["hub_repo"] = part.removeprefix("models--").replace("--", "/")
+            identity["revision"] = parts[i + 2]
+            identity["weights_identity"] = "Hugging Face cache snapshot revision"
+            return identity
+    commit = getattr(config, "_commit_hash", None)
+    if commit and not path.exists():
+        identity["revision"] = commit
+        identity["weights_identity"] = "Hugging Face Hub commit resolved at load"
+        return identity
+    if path.is_dir():
+        files = sorted(p for p in path.iterdir() if p.is_file() and p.name.endswith((".safetensors", ".bin")))
+        identity["local_path"] = str(path.resolve())
+        identity["weight_files"] = [{"name": p.name, "bytes": p.stat().st_size, "mtime": p.stat().st_mtime}
+                                    for p in files]
+        identity["weights_identity"] = "local folder: file names, sizes and mtimes (not a content hash)"
+    return identity
+
+
+# A rejected or failed attempt's record keeps at most this much of its input.
+# Accepted runs keep the exact prompt and every token.
+RECORD_PROMPT_EXCERPT = 2_000  # characters
+RECORD_TOKEN_EXCERPT = 256
+
+
+def _bounded_prompt(prompt: str) -> dict:
+    """The prompt as an attempt record holds it: exact when short, otherwise an
+    excerpt plus the full length and a SHA-256, marked as truncated."""
+    if len(prompt) <= RECORD_PROMPT_EXCERPT:
+        return {"prompt": prompt}
+    return {"prompt": prompt[:RECORD_PROMPT_EXCERPT], "prompt_truncated": True, "prompt_chars": len(prompt),
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}

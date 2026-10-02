@@ -113,6 +113,77 @@ class LoadEvent:
 Progress = Callable[[LoadEvent], None]
 
 
+@dataclass(frozen=True)
+class RunSettings:
+    """What the caller asks for. The record keeps these plus what was actually used.
+
+    Bounds are checked before any forward pass and rejected visibly, never
+    silently truncated: 1 <= top_k <= MAX_TOP_K, input tokens <= max_input_tokens
+    <= MAX_INPUT_TOKENS_CEILING, and the raw prompt <= MAX_PROMPT_CHARS characters
+    (checked before tokenizing).
+    """
+
+    top_k: int = 10
+    max_input_tokens: int = 4096
+
+
+MAX_TOP_K = 100
+MAX_INPUT_TOKENS_CEILING = 32_768  # max_input_tokens may not be set above this
+MAX_PROMPT_CHARS = 262_144  # raw text guard, checked before tokenizing
+
+
+@dataclass(frozen=True)
+class Token:
+    """One token as the tokenizer produced it: its id and its exact decoded text."""
+
+    id: int
+    text: str
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One next-token candidate at the final input position."""
+
+    id: int
+    text: str
+    probability: float  # softmax over the full vocabulary, computed in float32
+    logit: float
+
+
+@dataclass(frozen=True)
+class RunResult:
+    """One controlled forward pass: exact input, top next tokens, and how it ran.
+
+    No generation: a single forward over the prompt, scored at its last position.
+    `used` records the settings and runtime actually in effect (device, dtype,
+    tokenizer options), never the ones merely requested.
+    """
+
+    run_id: str
+    prompt: str
+    tokens: tuple[Token, ...]
+    candidates: tuple[Candidate, ...]
+    settings: RunSettings
+    used: dict[str, Any]
+    model: dict[str, Any]  # identity of the loaded model: class, ref, config digest, versions
+    timing: dict[str, float]  # seconds per stage
+    record_path: str | None = None  # None when nothing was saved; see record_error
+    record_error: str | None = None  # why saving the record failed, if it did
+
+
+class RunFailed(Exception):
+    """A run attempt that did not produce a result: failed, cancelled or rejected.
+    Carries the attempt's id and where its record was written (if it was)."""
+
+    def __init__(self, message: str, run_id: str, status: str, record_path: str | None,
+                 record_error: str | None = None) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+        self.status = status  # "failed" | "cancelled" | "rejected"
+        self.record_path = record_path
+        self.record_error = record_error
+
+
 class EngineError(RuntimeError):
     """The engine could not answer. The message is safe to show in the UI."""
 
@@ -137,4 +208,11 @@ class Engine(Protocol):
 
     def param_stats(self, module: str, tensor: str) -> TensorStats:
         """Statistics of one tensor, e.g. ("model.layers.3.mlp.up_proj", "weight")."""
+        ...
+
+    def run(self, prompt: str, settings: RunSettings,
+            cancelled: Callable[[], bool] | None = None) -> RunResult:
+        """One forward pass over `prompt`, scored at the last position. Never
+        generates. `cancelled` is checked at the run's boundaries only: a forward
+        already executing is not interrupted."""
         ...

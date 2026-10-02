@@ -27,3 +27,6 @@ __pycache__/
 # Downloaded HF tokenizer fixtures (scripts/fetch-hf-fixtures.sh)
 crates/sememe/tests/data/
 .pytest_cache/
+
+# Worktrees live inside the repo by convention; never track them.
+.worktrees/
