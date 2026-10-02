@@ -33,7 +33,8 @@ class TorchEngineTests(unittest.TestCase):
         self.model = TinyModel()
         self.engine = TorchEngine()
         fake_transformers = types.SimpleNamespace(
-            AutoModel=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: self.model)
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: types.SimpleNamespace()),
+            AutoModel=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: self.model),
         )
         with patch.dict(sys.modules, {"transformers": fake_transformers}):
             self.info = self.engine.load(Path.cwd())
@@ -70,3 +71,37 @@ class TorchEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _cached_qwen() -> Path | None:
+    from sememe.sources import scan_hub_cache
+    return next((c.folder for c in scan_hub_cache() if c.label == "Qwen/Qwen3.5-0.8B" and c.loadable), None)
+
+
+@unittest.skipIf(torch is None or _cached_qwen() is None, "needs sememe[torch] and a cached Qwen/Qwen3.5-0.8B")
+class RealLoadEventTests(unittest.TestCase):
+    """Against the real transformers loader: the counts it reports are its own."""
+
+    def test_install_events_count_every_parameter_and_the_hook_is_restored(self) -> None:
+        import transformers.core_model_loading as loading
+        original = loading.tqdm
+        events = []
+        info = TorchEngine().load(_cached_qwen(), events.append)
+        install = [e for e in events if e.phase == "install"]
+        self.assertGreater(len(install), 1)
+        self.assertEqual([e.done for e in install], list(range(1, install[-1].total + 1)))
+        self.assertTrue(install[-1].finished and install[-1].unit == "parameters")
+        self.assertEqual([e.phase for e in events if e.finished],
+                         ["import", "config", "install", "inspect"])
+        self.assertIs(loading.tqdm, original)
+        self.assertGreater(info.param_count, 0)
+
+    def test_a_failed_load_still_restores_the_hook_and_names_its_phase(self) -> None:
+        import transformers.core_model_loading as loading
+        original = loading.tqdm
+        engine = TorchEngine()
+        with patch("transformers.AutoModel.from_pretrained", side_effect=RuntimeError("disk vanished")):
+            with self.assertRaises(EngineError) as caught:
+                engine.load(_cached_qwen())
+        self.assertIn("install failed: disk vanished", str(caught.exception))
+        self.assertIs(loading.tqdm, original)

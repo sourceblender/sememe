@@ -8,7 +8,7 @@ from textual.widgets import Button, DataTable, Static
 from sememe.engine.fake import FakeEngine
 from sememe.sources import choice_for_path, hub_cache_dir, scan_hub_cache
 from sememe.ui.app import Cockpit
-from sememe.ui.picker import ModelMenu, DiskPicker, HubPicker
+from sememe.ui.picker import DiskPicker, HubPicker, ModelMenu
 
 
 def model_folder(folder: Path, config: bool = True, weights: bool = True) -> Path:
@@ -59,10 +59,23 @@ def test_picking_a_file_picks_its_model_folder(tmp_path):
     assert choice_for_path(tmp_path).problem == "no config.json"
 
 
-async def cockpit_with(pilot_size, tmp_path, monkeypatch):
+async def cockpit_with(pilot_size, tmp_path, monkeypatch, factory=FakeEngine):
+    """A cockpit started with no model (the Off screen), loading through `factory`."""
     monkeypatch.setenv("HF_HUB_CACHE", str(fake_hub(tmp_path)))
     monkeypatch.setenv("HOME", str(tmp_path))
-    return Cockpit(FakeEngine(), "fake", mock=True)
+    return Cockpit(mock=True, engine_factory=factory)
+
+
+async def until(pilot, check, seconds=3.0):
+    for _ in range(int(seconds / 0.05)):
+        if check():
+            return
+        await pilot.pause(0.05)
+    raise AssertionError("condition never became true")
+
+
+def log_text(app) -> str:
+    return "\n".join("".join(seg.text for seg in line) for line in app.w_log.lines)
 
 
 @pytest.mark.asyncio
@@ -91,24 +104,24 @@ async def test_clicking_model_opens_the_menu(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_choosing_a_cached_model_records_it_without_loading(tmp_path, monkeypatch):
+async def test_choosing_a_cached_model_loads_it_with_measured_progress(tmp_path, monkeypatch):
     app = await cockpit_with((160, 50), tmp_path, monkeypatch)
     async with app.run_test(size=(160, 50)) as pilot:
         await pilot.pause(0.3)
-        assert app.query_one("#menu-play", Button).disabled
-        await pilot.press("f10", "enter")  # first entry: Load Hugging Face Model…
+        assert app.state == "off" and app.query_one("#menu-play", Button).disabled
+        assert not app.query_one("#monitor").display
+        await pilot.press("f10", "enter")  # Load Hugging Face Model…
         await pilot.pause(0.2)
         assert isinstance(app.screen, HubPicker)
-        assert app.screen.query_one("#hub-models", DataTable).row_count == 3
-        await pilot.press("enter")  # the highlighted, loadable Qwen row
-        await pilot.pause(0.2)
-        assert not isinstance(app.screen, HubPicker)
-        assert app.choice is not None and app.choice.label == "Qwen/Qwen3.5-0.8B"
+        await pilot.press("enter")  # the loadable Qwen row
+        await until(pilot, lambda: app.state == "loaded")
+        assert app.choice.label == "Qwen/Qwen3.5-0.8B" and app.info is not None
         shown = str(app.query_one("#menu-selection", Static).render())
-        assert "Qwen/Qwen3.5-0.8B @ abc1234" in shown and "stopped" in shown
+        assert "Qwen/Qwen3.5-0.8B @ abc1234" in shown and "loaded · stopped" in shown
         assert not app.query_one("#menu-play", Button).disabled
         assert app.query_one("#menu-stop", Button).disabled
-        assert app.model_ref == "fake"  # the mock is still what is loaded
+        log = log_text(app)
+        assert "install" in log and "467/467 parameters" in log and "modules enumerated" in log
 
 
 @pytest.mark.asyncio
@@ -170,7 +183,7 @@ async def test_the_disk_picker_selects_a_model_folder(tmp_path, monkeypatch):
         await pilot.pause(0.3)
         assert not picker.query_one("#disk-select", Button).disabled
         await pilot.click("#disk-select")
-        await pilot.pause(0.2)
+        await until(pilot, lambda: app.state == "loaded")
         assert app.choice is not None and app.choice.folder == folder and app.choice.source == "disk"
 
 
@@ -285,3 +298,101 @@ async def test_the_cockpit_keeps_running_while_a_dialog_stays_open(tmp_path, mon
         await pilot.press("f10", "enter")
         await pilot.pause(1.6)  # several monitor ticks with the picker on top
         assert app.is_running and isinstance(app.screen, HubPicker)
+
+
+
+@pytest.mark.asyncio
+async def test_with_no_model_it_starts_off_with_the_title_art(tmp_path, monkeypatch):
+    app = await cockpit_with((160, 50), tmp_path, monkeypatch)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause(0.2)
+        assert app.state == "off" and app.info is None
+        assert app.query_one("#stage").current == "off"
+        assert "debugger for a model" in str(app.query_one("#off", Static).render())
+        await pilot.press("f10")
+        await pilot.pause(0.1)
+        close = app.screen.query_one("#model-options").get_option("close-model")
+        assert close.disabled  # nothing to close
+
+
+@pytest.mark.asyncio
+async def test_a_failure_keeps_where_it_stopped_and_why(tmp_path, monkeypatch):
+    app = await cockpit_with((160, 50), tmp_path, monkeypatch, factory=lambda: FakeEngine(fail_at=120))
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause(0.3)
+        await pilot.press("f10", "enter")
+        await pilot.pause(0.2)
+        await pilot.press("enter")
+        await until(pilot, lambda: app.state == "failed")
+        assert app.info is None and app.query_one("#menu-play", Button).disabled
+        assert app.w_bar.progress == 119 and app.w_bar.total == 467  # the bar stays where it stopped
+        log = log_text(app)
+        assert "FAILED during install at 119/467 parameters" in log and "mock failure installing" in log
+        assert "load failed" in str(app.query_one("#menu-selection", Static).render())
+
+
+@pytest.mark.asyncio
+async def test_close_unloads_and_returns_to_off(tmp_path, monkeypatch):
+    engines = []
+
+    def factory():
+        engines.append(FakeEngine())
+        return engines[-1]
+
+    app = await cockpit_with((160, 50), tmp_path, monkeypatch, factory=factory)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause(0.3)
+        await pilot.press("f10", "enter")
+        await pilot.pause(0.2)
+        await pilot.press("enter")
+        await until(pilot, lambda: app.state == "loaded")
+        await pilot.press("f10", "down", "down", "enter")  # Close Model
+        await until(pilot, lambda: app.state == "off")
+        assert app.engine is None and app.info is None and app.choice is None
+        assert engines[0]._info is None  # the engine dropped its model too
+        assert app.query_one("#stage").current == "off"
+        assert app.query_one("#menu-play", Button).disabled
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_load_never_publishes(tmp_path, monkeypatch):
+    import threading
+
+    release = threading.Event()
+
+    class Slow(FakeEngine):
+        def load(self, model, progress=None):
+            release.wait(5)
+            return super().load(model, progress)
+
+    engines = []
+
+    def factory():
+        engines.append(Slow() if not engines else FakeEngine())
+        return engines[-1]
+
+    folder = model_folder(tmp_path / "models" / "second")
+    app = await cockpit_with((160, 50), tmp_path, monkeypatch, factory=factory)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause(0.3)
+        await pilot.press("f10", "enter")
+        await pilot.pause(0.2)
+        await pilot.press("enter")  # first load: blocks
+        await until(pilot, lambda: app.state == "loading")
+        from sememe.sources import choice_for_path
+        app.model_chosen(choice_for_path(folder))  # a second pick while the first is still loading
+        await until(pilot, lambda: app.state == "loaded")
+        assert app.engine is engines[1]
+        release.set()  # now let the first one finish
+        await pilot.pause(0.5)
+        assert app.engine is engines[1] and app.model_ref == "second"
+        assert engines[0]._info is None  # its late result was closed, not published
+
+
+
+def test_startup_labels_are_short():
+    from sememe.sources import label_for
+    snap = "/x/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f/"
+    assert label_for(snap) == "Qwen/Qwen3.5-0.8B @ 2fc0636"
+    assert label_for("/data/models/my-model") == "my-model"
+    assert label_for("Qwen/Qwen3.5-0.8B") == "Qwen/Qwen3.5-0.8B"

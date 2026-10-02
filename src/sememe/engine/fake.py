@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from pathlib import Path
 
-from sememe.engine.api import EngineError, ModelInfo, ModuleInfo, TensorInfo, TensorStats
+from sememe.engine.api import EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, TensorInfo, TensorStats
 
 HIDDEN = 1024
 INTERMEDIATE = 3584
@@ -134,12 +135,33 @@ def qwen_like_model_info() -> ModelInfo:
 class FakeEngine:
     """Implements `Engine` with no model behind it."""
 
-    def __init__(self) -> None:
+    def __init__(self, step_delay: float = 0.0, fail_at: int | None = None) -> None:
         self._info: ModelInfo | None = None
+        self.step_delay = step_delay  # > 0 lets `--mock` show the loading screen
+        self.fail_at = fail_at  # a parameter index to fail on, for tests
 
-    def load(self, model: str | Path) -> ModelInfo:
-        self._info = qwen_like_model_info()
+    def load(self, model: str | Path, progress: Progress | None = None) -> ModelInfo:
+        """Walk the same phases as the real engine over the fake parameter list.
+        Every message says MOCK: these steps measure nothing."""
+        emit = progress or (lambda event: None)
+        start = time.monotonic()
+        info = qwen_like_model_info()
+        params = [(f"{m.path}.{t.name}", t) for m in info.modules for t in m.params]
+        emit(LoadEvent("config", "config read — MOCK", time.monotonic() - start, finished=True))
+        for i, (name, _) in enumerate(params, 1):
+            if self.fail_at is not None and i == self.fail_at:
+                raise EngineError(f"mock failure installing {name}")
+            if self.step_delay:
+                time.sleep(self.step_delay)
+            emit(LoadEvent("install", "parameters installed — MOCK", time.monotonic() - start,
+                           done=i, total=len(params), unit="parameters", item=name, finished=i == len(params)))
+        emit(LoadEvent("inspect", f"{len(info.modules)} modules enumerated — MOCK", time.monotonic() - start,
+                       finished=True))
+        self._info = info
         return self._info
+
+    def close(self) -> None:
+        self._info = None
 
     def model_info(self) -> ModelInfo:
         if self._info is None:
