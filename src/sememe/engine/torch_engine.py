@@ -6,11 +6,15 @@ run in mock mode without the optional model dependencies installed.
 
 from __future__ import annotations
 
+import contextlib
 import math
+import threading
+import time
 from pathlib import Path
+from typing import Callable
 from typing import Any
 
-from .api import EngineError, ModelInfo, ModuleInfo, TensorInfo, TensorStats
+from .api import EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, TensorInfo, TensorStats
 
 
 class TorchEngine:
@@ -22,27 +26,65 @@ class TorchEngine:
         self._info: ModelInfo | None = None
         self._torch: Any | None = None
 
-    def load(self, model: str | Path) -> ModelInfo:
-        try:
-            import torch
-            from transformers import AutoModel
-        except ImportError as exc:
-            raise EngineError(
-                "Model inspection needs the optional torch dependencies; "
-                "install sememe[torch]."
-            ) from exc
+    def load(self, model: str | Path, progress: Progress | None = None,
+             cancelled: Callable[[], bool] | None = None) -> ModelInfo:
+        """Load weights and describe the model. Never runs a forward pass.
 
-        identifier = str(model)
-        if not identifier:
-            raise EngineError("Choose a model directory or Hub id.")
-        if isinstance(model, Path) and not model.is_dir():
-            raise EngineError(f"Model directory does not exist: {model}")
+        Phases, each reported with a measured basis (see `LoadEvent`):
+        import → config → install (parameters installed into the model, counted
+        from transformers' own loading loop) → inspect.
+
+        Installed is not "read from disk": transformers memory-maps safetensors,
+        so a weight's bytes are paged in when something first touches them (for
+        example `param_stats`). No step here claims otherwise.
+        """
+        emit = progress or (lambda event: None)
+        start = time.monotonic()
+        clock = lambda: time.monotonic() - start  # noqa: E731
+        phase = "import"
+        stop = cancelled or (lambda: False)
+
+        def check() -> None:
+            if stop():
+                raise EngineError(f"cancelled before {phase}: a newer load replaced this one")
 
         try:
-            loaded = AutoModel.from_pretrained(
-                identifier, dtype="auto", trust_remote_code=False
-            )
+            emit(LoadEvent("import", "importing torch and transformers", clock()))
+            try:
+                import torch
+                from transformers import AutoConfig, AutoModel
+            except ImportError as exc:
+                raise EngineError(
+                    "Model inspection needs the optional torch dependencies; "
+                    "install sememe[torch]."
+                ) from exc
+            emit(LoadEvent("import", "torch and transformers imported", clock(), finished=True))
+
+            identifier = str(model)
+            if not identifier:
+                raise EngineError("Choose a model directory or Hub id.")
+            if isinstance(model, Path) and not model.is_dir():
+                raise EngineError(f"Model directory does not exist: {model}")
+
+            phase = "config"
+            check()
+            emit(LoadEvent("config", "reading config", clock()))
+            config = AutoConfig.from_pretrained(identifier, trust_remote_code=False)
+            emit(LoadEvent("config", f"config read: {type(config).__name__}", clock(), finished=True))
+
+            phase = "install"
+            emit(LoadEvent("install", "installing parameters", clock()))
+            with _install_events(check, lambda done, total, name: emit(LoadEvent(
+                    "install", "parameters installed", clock(), done=done, total=total,
+                    unit="parameters", item=name, finished=done == total))) as seen:
+                loaded = AutoModel.from_pretrained(identifier, config=config, dtype="auto", trust_remote_code=False)
+            if not seen:
+                emit(LoadEvent("install", "weights installed (this transformers version reports no per-parameter "
+                               "events)", clock(), finished=True))
             loaded.eval()
+
+            phase = "inspect"
+            emit(LoadEvent("inspect", "enumerating modules", clock()))
             modules = dict(loaded.named_modules())
             info = ModelInfo(
                 class_name=type(loaded).__name__,
@@ -63,8 +105,11 @@ class TorchEngine:
                     for path, module in modules.items()
                 ),
             )
+            emit(LoadEvent("inspect", f"{len(modules)} modules enumerated", clock(), finished=True))
+        except EngineError:
+            raise
         except Exception as exc:
-            raise EngineError(f"Could not load and inspect model: {exc}") from exc
+            raise EngineError(f"{phase} failed: {exc}") from exc
 
         # Publish a complete snapshot only after loading and enumeration succeed.
         self._torch = torch
@@ -72,6 +117,12 @@ class TorchEngine:
         self._modules = modules
         self._info = info
         return info
+
+    def close(self) -> None:
+        """Drop every reference to the model so its memory can be freed."""
+        self._model = None
+        self._modules = {}
+        self._info = None
 
     def model_info(self) -> ModelInfo:
         if self._info is None:
@@ -163,3 +214,49 @@ def _stats(tensor: Any, torch: Any) -> TensorStats:
         zero_fraction=zero_count / count,
         histogram=tuple(histogram),
     )
+
+
+# transformers installs weights in a loop it wraps with its own `tqdm`
+# (transformers.core_model_loading, "Loading weights"): one step per parameter,
+# over a sized collection. We swap that name for a pass-through that yields every
+# item unchanged and reports the count. It is a module global, so loads are
+# serialised; a second load waits rather than racing the swap.
+_INSTALL_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _install_events(check, report):
+    seen: list[int] = []
+    with _INSTALL_LOCK:
+        check()  # a load that waited here behind another may be superseded by now
+        try:
+            import transformers.core_model_loading as loading
+        except ImportError:  # a transformers without this module: no events
+            yield seen
+            return
+        original = getattr(loading, "tqdm", None)
+
+        class PassThrough:
+            def __init__(self, iterable=None, *args, **kwargs):
+                self.iterable = iterable if iterable is not None else ()
+                self.total = len(self.iterable) if hasattr(self.iterable, "__len__") else None
+
+            def __iter__(self):
+                for i, item in enumerate(self.iterable, 1):
+                    yield item
+                    seen.append(i)
+                    name = item[0] if isinstance(item, tuple) and item else str(item)
+                    if self.total:
+                        report(i, self.total, str(name))
+
+            def __getattr__(self, name):  # update/close/set_postfix and friends
+                return lambda *a, **k: None
+
+        if original is None:
+            yield seen
+            return
+        loading.tqdm = PassThrough
+        try:
+            yield seen
+        finally:
+            loading.tqdm = original

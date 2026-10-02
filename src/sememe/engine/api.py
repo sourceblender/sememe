@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 @dataclass(frozen=True)
@@ -87,6 +87,31 @@ class TensorStats:
     histogram: tuple[int, ...]  # counts in equal-width bins over [min, max]
 
 
+@dataclass(frozen=True)
+class LoadEvent:
+    """One measured step of a load. A bar is drawn only when `total` is known,
+    and its fraction always means `done` of `total` `unit` — never elapsed time.
+
+    phase:   "import", "config", "install" or "inspect"
+    message: what happened, in words, e.g. "parameters installed"
+    done/total/unit: the measured basis, e.g. 120 of 473 "parameters"
+    item:    the parameter or tensor this step concerned, when the loader says
+    elapsed: seconds since the load started
+    """
+
+    phase: str
+    message: str
+    elapsed: float
+    done: int | None = None
+    total: int | None = None
+    unit: str = ""
+    item: str = ""
+    finished: bool = False  # the phase is complete (its last event)
+
+
+Progress = Callable[[LoadEvent], None]
+
+
 class EngineError(RuntimeError):
     """The engine could not answer. The message is safe to show in the UI."""
 
@@ -95,8 +120,14 @@ class Engine(Protocol):
     """What the UI may ask of a model. Every method may block; the UI calls
     them from a worker thread, never from its event loop."""
 
-    def load(self, model: str | Path) -> ModelInfo:
-        """Load a model (a local snapshot directory or a Hub id) and describe it."""
+    def load(self, model: str | Path, progress: Progress | None = None,
+             cancelled: Callable[[], bool] | None = None) -> ModelInfo:
+        """Load a model (a local snapshot directory or a Hub id) and describe it.
+        Loading never runs the model. `progress` receives measured LoadEvents
+        from the worker thread that calls load. Every phase opens with an
+        event before its work starts, so a failure is attributed to the phase
+        it happened in. `cancelled` is checked before expensive steps; a
+        superseded load stops there rather than allocating a model."""
         ...
 
     def model_info(self) -> ModelInfo:

@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from pathlib import Path
+from typing import Callable
 
-from sememe.engine.api import EngineError, ModelInfo, ModuleInfo, TensorInfo, TensorStats
+from sememe.engine.api import EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, TensorInfo, TensorStats
 
 HIDDEN = 1024
 INTERMEDIATE = 3584
@@ -134,12 +136,47 @@ def qwen_like_model_info() -> ModelInfo:
 class FakeEngine:
     """Implements `Engine` with no model behind it."""
 
-    def __init__(self) -> None:
+    def __init__(self, step_delay: float = 0.0, fail_at: int | None = None, fail_in: str | None = None) -> None:
         self._info: ModelInfo | None = None
+        self.step_delay = step_delay  # > 0 lets `--mock` show the loading screen
+        self.fail_at = fail_at  # a parameter index to fail on, for tests
+        self.fail_in = fail_in  # a phase to fail at the start of ("config", "install"), for tests
 
-    def load(self, model: str | Path) -> ModelInfo:
-        self._info = qwen_like_model_info()
+    def load(self, model: str | Path, progress: Progress | None = None,
+             cancelled: Callable[[], bool] | None = None) -> ModelInfo:
+        """Walk the same phases as the real engine over the fake parameter list.
+        Every message says MOCK: these steps measure nothing."""
+        emit = progress or (lambda event: None)
+        stop = cancelled or (lambda: False)
+        start = time.monotonic()
+        clock = lambda: time.monotonic() - start  # noqa: E731
+        info = qwen_like_model_info()
+        params = [(f"{m.path}.{t.name}", t) for m in info.modules for t in m.params]
+
+        def begin(phase: str, message: str) -> None:
+            if stop():
+                raise EngineError(f"cancelled before {phase}")
+            emit(LoadEvent(phase, message, clock()))
+            if self.fail_in == phase:
+                raise EngineError(f"mock failure in {phase}")
+
+        begin("config", "reading config — MOCK")
+        emit(LoadEvent("config", "config read — MOCK", clock(), finished=True))
+        begin("install", "installing parameters — MOCK")
+        for i, (name, _) in enumerate(params, 1):
+            if self.fail_at is not None and i == self.fail_at:
+                raise EngineError(f"mock failure installing {name}")
+            if self.step_delay:
+                time.sleep(self.step_delay)
+            emit(LoadEvent("install", "parameters installed — MOCK", clock(),
+                           done=i, total=len(params), unit="parameters", item=name, finished=i == len(params)))
+        begin("inspect", "enumerating modules — MOCK")
+        emit(LoadEvent("inspect", f"{len(info.modules)} modules enumerated — MOCK", clock(), finished=True))
+        self._info = info
         return self._info
+
+    def close(self) -> None:
+        self._info = None
 
     def model_info(self) -> ModelInfo:
         if self._info is None:

@@ -145,6 +145,19 @@ def choice_for_path(path: Path) -> ModelChoice:
     return ModelChoice(folder.name or str(folder), folder, "disk", problem=model_problem(folder))
 
 
+def label_for(ref: str) -> str:
+    """A short name for a model reference: "org/name @ rev" for a cache
+    snapshot path, the folder name for another path, the Hub id otherwise."""
+    path = Path(ref).expanduser()
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part.startswith("models--") and i + 2 < len(parts) and parts[i + 1] == "snapshots":
+            return f"{part.removeprefix('models--').replace('--', '/')} @ {parts[i + 2][:7]}"
+    if path.is_absolute() or ref.startswith((".", "~")):
+        return path.name or ref
+    return ref
+
+
 def human_bytes(n: int | None) -> str:
     if n is None:
         return "?"

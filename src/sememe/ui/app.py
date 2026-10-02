@@ -8,6 +8,7 @@ a model loads. Panels whose data is not real yet say MOCK in their title.
 from __future__ import annotations
 
 import argparse
+from typing import Callable
 import random
 from collections import deque
 from dataclasses import dataclass
@@ -20,11 +21,14 @@ from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import (
     Button,
+    ContentSwitcher,
     DataTable,
     Footer,
     Header,
     Input,
     Label,
+    ProgressBar,
+    RichLog,
     Sparkline,
     Static,
     TabbedContent,
@@ -32,9 +36,9 @@ from textual.widgets import (
     Tree,
 )
 
-from sememe.engine.api import Engine, EngineError, ModelInfo, ModuleInfo
-from sememe.sources import ModelChoice
-from sememe.ui.picker import LOAD_DISK, LOAD_HF, ModelMenu, DiskPicker, HubPicker, MenuBar, describe
+from sememe.engine.api import Engine, EngineError, LoadEvent, ModelInfo, ModuleInfo
+from sememe.sources import ModelChoice, label_for
+from sememe.ui.picker import CLOSE_MODEL, LOAD_DISK, LOAD_HF, ModelMenu, DiskPicker, HubPicker, MenuBar, describe
 
 # Component kinds, each with one colour across the whole UI.
 # Fixed colours, so every terminal and theme draws a kind the same way.
@@ -48,6 +52,17 @@ KIND_STYLE = {
     "vision": "#1e1e1e on #61afef",
     "other": "#d0d0d0 on #3e4451",
 }
+OFF_ART = Text.assemble(
+    ("""
+███████ ███████ ███    ███ ███████ ███    ███ ███████
+██      ██      ████  ████ ██      ████  ████ ██
+███████ █████   ██ ████ ██ █████   ██ ████ ██ █████
+     ██ ██      ██  ██  ██ ██      ██  ██  ██ ██
+███████ ███████ ██      ██ ███████ ██      ██ ███████
+""", "bold #56b6c2"),
+    ("\na debugger for a model's forward pass\n\n", "dim"),
+    ("Model ▾", "bold"), ("  (F10)  →  Load Hugging Face Model…  or  Load Model from Disk…", ""),
+)
 MONITOR = {  # name: (label, typical value for the synthetic series)
     "prefill": ("prefill tok/s", 2400.0),
     "decode": ("decode tok/s", 48.0),
@@ -225,6 +240,13 @@ class Cockpit(App):
     MenuBar Button.menu:disabled { color: $text-disabled; }
     #menu-spacer { width: 1fr; }
     #menu-selection { width: auto; padding: 0 1; }
+    #stage { height: 1fr; }
+    #off { width: 1fr; height: 1fr; content-align: center middle; text-align: center; }
+    #loading { padding: 1 2; }
+    #load-title { margin-bottom: 1; }
+    #load-bar { margin-bottom: 1; }
+    #load-basis { height: 2; margin-bottom: 1; }
+    #load-log { height: 1fr; border: round $panel-lighten-2; }
     """
     BINDINGS = [
         Binding("f10", "menu", "menu"),
@@ -234,29 +256,45 @@ class Cockpit(App):
     ]
     TITLE = "sememe"
 
-    def __init__(self, engine: Engine, model: str, mock: bool) -> None:
+    def __init__(self, engine: Engine | None = None, model: str | None = None, mock: bool = False,
+                 engine_factory: Callable[[], Engine] | None = None) -> None:
+        """`model` given: load it at startup. Otherwise start on the Off screen.
+        `engine_factory` makes a fresh engine for each load from the Model menu."""
         super().__init__()
-        self.engine = engine
-        self.model_ref = model
         self.mock = mock
+        self.startup_engine = engine
+        self.startup_model = model
+        self.engine_factory = engine_factory or (_fake_factory if mock else _torch_factory)
+        self.engine: Engine | None = None  # the engine whose model is loaded
+        self.model_ref: str | None = None
         self.info: ModelInfo | None = None
         self.selected: str | None = None
-        self.choice: ModelChoice | None = None  # picked in the menu, not loaded
+        self.choice: ModelChoice | None = None  # what the Model menu picked
+        self.state = "off"  # off | loading | loaded | failed
+        self.load_token = 0  # bumped by every load and close; stale results are dropped
+        self.last_event: LoadEvent | None = None
         self.series = {name: deque([base] * 60, maxlen=60) for name, (_, base) in MONITOR.items()}
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield MenuBar(id="menubar")
         yield Input(placeholder="jump to module path…", id="search")
-        with TabbedContent(id="tabs"):
-            with TabPane("Architecture", id="tab-arch"):
-                with Horizontal(id="main"):
-                    yield BlockMap(id="blockmap")
-                    yield Sidebar(id="sidebar")
-            with TabPane("Tables", id="tab-tables"):
-                yield DataTable(id="all-params", cursor_type="row", zebra_stripes=True)
-            with TabPane("Decode — MOCK", id="tab-decode"):
-                yield Static(id="decode")
+        with ContentSwitcher(initial="off", id="stage"):
+            yield Static(OFF_ART, id="off")
+            with Vertical(id="loading"):
+                yield Label("", id="load-title")
+                yield ProgressBar(id="load-bar", show_eta=False)
+                yield Static("", id="load-basis")
+                yield RichLog(id="load-log", markup=False, wrap=True)
+            with TabbedContent(id="tabs"):
+                with TabPane("Architecture", id="tab-arch"):
+                    with Horizontal(id="main"):
+                        yield BlockMap(id="blockmap")
+                        yield Sidebar(id="sidebar")
+                with TabPane("Tables", id="tab-tables"):
+                    yield DataTable(id="all-params", cursor_type="row", zebra_stripes=True)
+                with TabPane("Decode — MOCK", id="tab-decode"):
+                    yield Static(id="decode")
         with Horizontal(id="monitor"):
             for name, (label, _) in MONITOR.items():
                 with Vertical():
@@ -265,43 +303,144 @@ class Cockpit(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.sub_title = f"loading {self.model_ref}…"
-        self.load_model()
         # Held, not queried per tick: a tick that lands while the app is shutting
         # down would otherwise find no widgets and raise.
         self.monitor_widgets = {name: (self.query_one(f"#mon-{name}", Sparkline),
                                        self.query_one(f"#mon-{name}-label", Label)) for name in MONITOR}
         self.set_interval(0.5, self.tick_monitor)
+        # The loading widgets are held for the same reason: a load worker can
+        # still report while the app shuts down.
+        self.w_title = self.query_one("#load-title", Label)
+        self.w_bar = self.query_one("#load-bar", ProgressBar)
+        self.w_basis = self.query_one("#load-basis", Static)
+        self.w_log = self.query_one("#load-log", RichLog)
         self.query_one("#decode", Static).update(Text.assemble(
             ("Decode — MOCK\n\n", "bold"), ("> The cat sat on the\n\n", ""),
             ("next token   mat 0.61 · floor 0.12 · couch 0.07\n", "green"),
             ("\nA real prompt run arrives in a later slice.", "dim")))
+        self.show_state("off")
+        if self.startup_model:
+            self.start_load(self.startup_model, label_for(self.startup_model), engine=self.startup_engine)
 
-    @work(thread=True, exclusive=True)
-    def load_model(self) -> None:
+    # ---- the load lifecycle -------------------------------------------------
+
+    def show_state(self, state: str) -> None:
+        self.state = state
+        self.query_one("#stage", ContentSwitcher).current = {"off": "off", "loaded": "tabs"}.get(state, "loading")
+        self.query_one("#monitor").display = state == "loaded"
+        self.query_one("#menu-selection", Static).update(describe(self.model_ref, state))
+        self.query_one("#menu-play", Button).disabled = state != "loaded"
+        if state == "off":
+            self.sub_title = ""
+
+    def start_load(self, ref: str, label: str, engine: Engine | None = None) -> None:
+        self.load_token += 1
+        # Release the current model before its replacement allocates, so two
+        # models' weights are not held at once, and nothing of it stays on screen.
+        self.release_model()
+        self.model_ref = label
+        self.last_event = None
+        self.w_title.update(Text.assemble(("loading ", "dim"), (label, "bold")))
+        bar = self.w_bar
+        bar.update(total=None, progress=0)
+        self.w_basis.update(Text("waiting for the first event…", style="dim"))
+        self.w_log.clear()
+        self.sub_title = f"loading {label}…"
+        self.show_state("loading")
+        self.load_model(engine, ref, self.load_token)
+
+    @work(thread=True, group="load")
+    def load_model(self, engine: Engine | None, ref: str, token: int) -> None:
+        def progress(event: LoadEvent) -> None:
+            self.call_from_thread(self.on_load_event, token, event)
         try:
-            info = self.engine.load(self.model_ref)
+            engine = engine or self.engine_factory()  # in the worker: a missing torch is a load failure
+            info = engine.load(ref, progress, cancelled=lambda: token != self.load_token)
         except Exception as exc:  # the message is shown, never swallowed
-            self.call_from_thread(self.load_failed, str(exc))
+            self.call_from_thread(self.load_failed, token, str(exc))
             return
-        self.call_from_thread(self.loaded, info)
+        self.call_from_thread(self.loaded, token, engine, info)
 
-    def load_failed(self, message: str) -> None:
-        self.sub_title = f"load failed: {message}"
-        self.notify(message, title="load failed", severity="error", timeout=30)
+    def on_load_event(self, token: int, event: LoadEvent) -> None:
+        if token != self.load_token:
+            return  # a superseded load still reporting; its numbers are not this one's
+        previous, self.last_event = self.last_event, event
+        bar, basis = self.w_bar, self.w_basis
+        if event.total:
+            bar.update(total=event.total, progress=event.done or 0)
+            basis.update(Text.assemble((f"{event.message}  {event.done:,} / {event.total:,} {event.unit}", "bold"),
+                                       ("\n" + event.item if event.item else "", "dim")))
+        else:
+            bar.update(total=None)  # indeterminate: this phase exposes no count
+            basis.update(Text(event.message, style="bold"))
+        # The log keeps phase boundaries, not every step.
+        first_of_phase = previous is None or previous.phase != event.phase
+        if first_of_phase or event.finished:
+            count = f"  {event.done:,}/{event.total:,} {event.unit}" if event.total else ""
+            self.w_log.write(
+                Text.assemble((f"{event.elapsed:7.2f}s  ", "dim"), (f"{event.phase:<8}", "cyan"),
+                              f"{event.message}{count}"))
 
-    def loaded(self, info: ModelInfo) -> None:
+    def load_failed(self, token: int, message: str) -> None:
+        if token != self.load_token:
+            return
+        where = ""
+        if self.last_event is not None:
+            e = self.last_event
+            at = f" at {e.done:,}/{e.total:,} {e.unit}" if e.total else ""
+            where = f" during {e.phase}{at}" + (f" ({e.item})" if e.item else "")
+        # Everything stays on screen: the bar where it stopped, the log, the error.
+        self.w_log.write(Text(f"FAILED{where}: {message}", style="bold red"))
+        self.w_title.update(Text.assemble(("load failed: ", "red"), (self.model_ref or "", "bold")))
+        self.sub_title = "load failed"
+        self.show_state("failed")
+
+    def loaded(self, token: int, engine: Engine, info: ModelInfo) -> None:
+        if token != self.load_token:
+            _close(engine)  # superseded or closed while loading: never published
+            return
+        self.engine = engine
         self.info = info
+        self.selected = None
         tag = " — MOCK engine" if self.mock else ""
         self.sub_title = f"{info.class_name} · {len(info.modules)} modules · {human(info.param_count)} params{tag}"
         self.query_one(BlockMap).show(info)
+        self.reset_sidebar()
         table = self.query_one("#all-params", DataTable)
+        table.clear(columns=True)
         table.add_columns("module", "tensor", "kind", "shape", "dtype", "count", "bytes")
         for module in info.modules:
             for kind, tensors in (("param", module.params), ("buffer", module.buffers)):
                 for t in tensors:
                     table.add_row(module.path or "<root>", t.name, kind, "×".join(map(str, t.shape)),
                                   t.dtype.removeprefix("torch."), f"{t.numel:,}", human(t.bytes))
+        self.show_state("loaded")
+
+    def close_model(self) -> None:
+        """Unload: invalidate any load or stats in flight, drop every reference, go Off."""
+        self.load_token += 1
+        self.release_model()
+        self.choice = None
+        self.model_ref = None
+        self.show_state("off")
+
+    def release_model(self) -> None:
+        """Close the loaded engine and clear everything drawn from its model."""
+        if self.engine is not None:
+            _close(self.engine)
+        self.engine = None
+        self.info = None
+        self.selected = None
+        self.query_one(BlockMap).remove_children()
+        self.reset_sidebar()
+        self.query_one("#all-params", DataTable).clear(columns=True)
+
+    def reset_sidebar(self) -> None:
+        side = self.query_one(Sidebar)
+        side.query_one("#side-title", Static).update("select a block")
+        side.query_one("#side-params", DataTable).clear()
+        side.query_one("#side-stats", Static).update("")
+        side.query_one("#side-tree", Tree).clear()
 
     @on(Cell.Selected)
     def select_cell(self, event: Cell.Selected) -> None:
@@ -377,15 +516,21 @@ class Cockpit(App):
         module = self.info.module(self.selected)
         if module is None or not module.params:
             return
+        if self.engine is None:
+            return
         self.query_one("#side-stats", Static).update(Text("reading weights…", style="dim"))
-        self.fetch_stats(module.path, module.params[0].name)
+        self.fetch_stats(self.engine, self.load_token, module.path, module.params[0].name)
 
     @work(thread=True, exclusive=True, group="stats")
-    def fetch_stats(self, path: str, tensor: str) -> None:
+    def fetch_stats(self, engine: Engine, token: int, path: str, tensor: str) -> None:
+        """Stats for one tensor of `engine`'s model. The answer is published only
+        if, by the time it arrives, that engine is still the loaded one (same
+        load token) and the same module is still selected: a slow answer from a
+        replaced or closed model must never land in the new model's sidebar."""
         try:
-            stats = self.engine.param_stats(path, tensor)
+            stats = engine.param_stats(path, tensor)
         except (EngineError, Exception) as exc:
-            self.call_from_thread(self.query_one("#side-stats", Static).update, Text(str(exc), style="red"))
+            self.call_from_thread(self.publish_stats, engine, token, path, Text(str(exc), style="red"))
             return
         bars = "▁▂▃▄▅▆▇█"
         top = max(stats.histogram) or 1
@@ -394,11 +539,15 @@ class Cockpit(App):
         text = Text.assemble((f"{tensor}{tag}\n", "bold"),
                              f"μ {stats.mean:+.4f}  σ {stats.std:.4f}  min {stats.min:+.3f}  max {stats.max:+.3f}\n",
                              f"‖·‖₂ {stats.l2_norm:.2f}  zeros {stats.zero_fraction:.1%}  {hist}")
-        if path == self.selected:
-            self.call_from_thread(self.query_one("#side-stats", Static).update, text)
+        self.call_from_thread(self.publish_stats, engine, token, path, text)
+
+    def publish_stats(self, engine: Engine, token: int, path: str, text: Text) -> None:
+        if token != self.load_token or engine is not self.engine or path != self.selected:
+            return
+        self.query_one("#side-stats", Static).update(text)
 
     def action_menu(self) -> None:
-        self.push_screen(ModelMenu(), self.menu_chosen)
+        self.push_screen(ModelMenu(can_close=self.state != "off"), self.menu_chosen)
 
     @on(Button.Pressed, "#menu-model")
     def model_pressed(self) -> None:
@@ -409,18 +558,21 @@ class Cockpit(App):
             self.push_screen(HubPicker(), self.model_chosen)
         elif item == LOAD_DISK:
             self.push_screen(DiskPicker(), self.model_chosen)
+        elif item == CLOSE_MODEL:
+            self.close_model()
 
     def model_chosen(self, choice: ModelChoice | None) -> None:
-        """Record the pick. Cancel (None) keeps whatever was selected before."""
+        """Picking a model loads its weights (never runs it). Cancel keeps
+        whatever was there before."""
         if choice is None:
             return
         self.choice = choice
-        self.query_one("#menu-selection", Static).update(describe(choice))
-        self.query_one("#menu-play", Button).disabled = False
+        rev = f" @ {choice.revision[:7]}" if choice.revision else ""
+        self.start_load(str(choice.folder), f"{choice.label}{rev}")
 
     @on(Button.Pressed, "#menu-play")
     def play_pressed(self) -> None:
-        self.notify("Starting a model arrives in the next slice. Nothing is loaded; the cockpit still shows the mock.",
+        self.notify("Running a prompt through the model arrives in the next slice. The weights are loaded and idle.",
                     title="Play", timeout=6)
 
     def tick_monitor(self) -> None:
@@ -434,22 +586,34 @@ class Cockpit(App):
             text.update(f"{label}  {series[-1]:,.1f}  — MOCK")
 
 
+def _fake_factory() -> Engine:
+    from sememe.engine.fake import FakeEngine
+    return FakeEngine(step_delay=0.004)  # slow enough to see the loading screen
+
+
+def _torch_factory() -> Engine:
+    try:
+        from sememe.engine.torch_engine import TorchEngine
+    except ImportError as exc:  # shown as a load failure, not a crash
+        raise EngineError(f"the real engine needs the torch extra ({exc}); try --mock") from exc
+    return TorchEngine()
+
+
+def _close(engine: Engine) -> None:
+    close = getattr(engine, "close", None)
+    if callable(close):
+        close()
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="sememe", description="A debugger for a model's forward pass.")
-    parser.add_argument("model", nargs="?", help="model snapshot directory or Hub id")
-    parser.add_argument("--mock", action="store_true", help="run on the built-in fake engine, no torch needed")
+    parser.add_argument("model", nargs="?", help="load this model snapshot directory or Hub id at startup")
+    parser.add_argument("--mock", action="store_true", help="use the built-in fake engine, no torch needed")
     args = parser.parse_args(argv)
-    if args.mock or not args.model:
-        from sememe.engine.fake import FakeEngine
-        engine: Engine = FakeEngine()
-        model, mock = args.model or "Qwen3.5-0.8B (fake)", True
+    if args.mock:
+        Cockpit(model=args.model or "Qwen3.5-0.8B (fake)", mock=True).run()
     else:
-        try:
-            from sememe.engine.torch_engine import TorchEngine
-        except ImportError as exc:
-            parser.error(f"the real engine needs the torch extra ({exc}); try --mock")
-        engine, model, mock = TorchEngine(), args.model, False
-    Cockpit(engine, model, mock).run()
+        Cockpit(model=args.model).run()  # no model: start on the Off screen
 
 
 if __name__ == "__main__":

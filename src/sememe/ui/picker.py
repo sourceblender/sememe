@@ -23,14 +23,19 @@ from sememe.sources import ModelChoice, choice_for_path, human_bytes, hub_cache_
 
 LOAD_HF = "load-hf"
 LOAD_DISK = "load-disk"
+CLOSE_MODEL = "close-model"
 
 
-def describe(choice: ModelChoice | None) -> Text:
-    """The one line the menu row shows for the current selection."""
-    if choice is None:
-        return Text("no model selected", style="dim")
-    rev = f" @ {choice.revision[:7]}" if choice.revision else ""
-    return Text.assemble(("selected: ", "dim"), (f"{choice.label}{rev}", "bold"), ("  ·  stopped", "dim"))
+STATE_STYLE = {"loading": ("loading…", "yellow"), "loaded": ("loaded · stopped", "green"),
+               "failed": ("load failed", "red")}
+
+
+def describe(label: str | None, state: str = "off") -> Text:
+    """The one line the menu row shows for the current model."""
+    if label is None or state == "off":
+        return Text("no model loaded", style="dim")
+    words, style = STATE_STYLE.get(state, (state, "dim"))
+    return Text.assemble((label, "bold"), ("  ·  ", "dim"), (words, style))
 
 
 class MenuBar(Horizontal):
@@ -46,7 +51,7 @@ class MenuBar(Horizontal):
 
 
 class ModelMenu(ModalScreen[str | None]):
-    """The dropdown under `Model ▾`."""
+    """The dropdown under `Model ▾`. Close is offered only when there is a model."""
 
     BINDINGS = [Binding("escape", "dismiss(None)", "close")]
     DEFAULT_CSS = """
@@ -54,9 +59,15 @@ class ModelMenu(ModalScreen[str | None]):
     ModelMenu OptionList { width: 32; height: auto; margin: 2 0 0 0; border: round $accent; }
     """
 
+    def __init__(self, can_close: bool = False) -> None:
+        super().__init__()
+        self.can_close = can_close
+
     def compose(self) -> ComposeResult:
         yield OptionList(Option("Load Hugging Face Model…", id=LOAD_HF),
-                         Option("Load Model from Disk…", id=LOAD_DISK), id="model-options")
+                         Option("Load Model from Disk…", id=LOAD_DISK),
+                         None,
+                         Option("Close Model", id=CLOSE_MODEL, disabled=not self.can_close), id="model-options")
 
     def on_mount(self) -> None:
         # Opened by keyboard, Enter must act on something: start on the first entry.
