@@ -93,6 +93,7 @@ class TorchEngine:
                     ModuleInfo(
                         path=path,
                         class_name=type(module).__name__,
+                        description=module.extra_repr(),
                         params=tuple(
                             _tensor_info(name, tensor)
                             for name, tensor in module.named_parameters(recurse=False)
