@@ -6,7 +6,8 @@
 
 M1 and M2 are built. The core types, the live `Telemetry` hub and the record schema are
 pure Rust and tested. The PyO3 bridge loads a real PyTorch model and walks its
-`named_modules()`. M2.1 hardens that bridge before M3 starts. The first model is
+`named_modules()`. M2.1 hardens that bridge. From here sememe grows slice by slice, starting with the
+TUI (see How we build from here). The first model is
 Qwen3.5-0.8B: same family and module layout as the larger Qwen3.5 models, small enough to
 test in seconds.
 
@@ -56,19 +57,11 @@ Recording is cheap. The recorder is a built-in watch sidecar that writes every e
 an NDJSON session log: model topology, forward passes, per-hook tensor observations, and
 every intervention with which breakpoint or sidecar made it and what changed.
 
-Replay is not free, and it gets its own milestone and proof. It needs a defined event
-order, tensor payloads that can be read back, the intervention decisions as recorded,
-and a model-off `Backend` that reproduces exactly the state the TUI showed. M1 through M5
-record what they can into the same log. M6 is the first milestone that replays.
-
-| Piece | Introduced | Notes |
-| --- | --- | --- |
-| Serializable record schema (serde-tagged `RecordedEvent`) | M1 | Pure Rust; the whole record format is this enum. |
-| Topology record (`ModuleTree`, once, at attach) | M2 | Recorded the first time a backend exposes its module tree. |
-| Observation records (per forward pass, per hook) | M3 | Written as hooks fire. |
-| Persisted session-log sink (NDJSON writer) | M4 | Recording leaves the in-memory store and lands on disk. |
-| Intervention records (who acted, path, before / after) | M5 | Breakpoint edits and intercept sidecars alike. |
-| Session-log reader, `Replayer` and replay `Backend` | M6 | Replay, with its own proof gate. |
+Replay is not free, and it gets its own slice and proof. It needs a defined event order,
+tensor payloads that can be read back, the intervention decisions as recorded, and a
+model-off `Backend` that reproduces exactly the state the TUI showed. The record schema
+from M1 and the topology record from M2 already exist; the rest arrives with the features
+that produce it.
 
 ## M1 — Core types in pure Rust
 
@@ -170,76 +163,61 @@ can't.
 **Gate.** `just gate`, with the bridge tests loading Qwen3.5-0.8B. Each fix is
 red-proofed: putting the old behaviour back fails a test.
 
-## M3 — Hooks, breakpoints, step and continue
+## How we build from here
 
-**Goal.** On the real model, a user can observe any module's output during one forward
-pass, pause there, and change it, and see the change downstream.
+PyTorch's hook surface is too large to design up front, so sememe grows from the app
+outward. First a cockpit you can sit in front of, mocked where data doesn't exist yet;
+then real data, one panel at a time, each slice chosen from a real question asked while
+using it. A panel without real data says `MOCK` in its title, so nothing on screen
+pretends to be measured.
 
-**Crate-level changes.** The bridge installs PyTorch forward hooks at requested module
-paths and streams observations into `Telemetry`. Hook lifetime is owned by the bridge: a
-forward that fails, or is cancelled, still removes every hook it installed. `Harness`
-gains breakpoints, `step` and `continue`, driven in-process from Rust (the TUI comes in
-M4). Each event carries the module path, a forward-pass ID and a typed tensor
-description.
+## Slice 1 — The cockpit
 
-**First proof.** One prompt through Qwen3.5-0.8B's `language_model`: record every
-layer's output, then zero (or scale) one whole module's output at a breakpoint and show
-which downstream modules change. That proves observe, break and intervene end to end on
-a module boundary `named_modules` actually exposes.
+**Goal.** Load Qwen3.5-0.8B and browse it as an architecture, with the whole layout in
+place.
 
-**Unverified until a live tensor read.** A single attention head is not a module
-boundary once heads are combined. The expected tap is a pre-forward hook on the attention
-output projection, reshaped to `[.., n_heads, head_dim]` so one head can be sliced. It
-stays out of the M3 gate until Qwen3.5's actual attention shapes are read.
+**Layout.**
 
-**Gate.** `just gate`, plus the first proof against the real model, and a test that a
-forward which raises leaves no hooks attached.
+- **Tabs**: Architecture, Tables, Decode. Hooks comes later.
+- **Architecture**: the model as blocks — embedding, the decoder blocks (each split into
+  attention and MLP), final norm and LM head, with the vision tower as a collapsed
+  branch. Color marks component type. Every block maps to a real module path.
+- **Sidebar**: the selected block's class, parameter shapes, dtypes and counts. Enter
+  drills into a block (attention's projections, the MLP's gate / up / down). Mouse and
+  keyboard select the same way.
+- **Search**: `/` jumps to a module by path.
+- **Monitoring strip**: a few lines at the bottom with running line charts for prefill
+  and decode throughput, per-step latency and memory. Not a benchmark: it's how you see
+  what a hook costs.
 
-## M4 — The TUI
+**Real in slice 1**: the block map from the actual module paths, and the sidebar's static
+details. **Mocked**: Tables, Decode and the monitoring strip, until their slices land.
 
-**Goal.** A human drives the debugger: browse the module tree, set breakpoints, read and
-edit the tensor at a breakpoint, and follow the forward pass.
+**Gate.** `just gate`, plus render tests that run without a terminal (the view builds a
+plain render model; ratatui only draws it), and the real Qwen load.
 
-**Crate-level changes.** Adds `crates/sememe-tui` (ratatui): module tree, tensor stats
-(shape, dtype, min / max / mean, samples), forward-pass timeline, and the breakpoint and
-sidecar lists, with vim keys. The TUI is a client of `Harness`, not a special case. M4
-also adds the NDJSON session-log sink, so recording lands on disk.
+## Backlog, in rough order
 
-**Gate.** `just gate` across all crates, plus a scripted TUI session against the real
-model that sets a breakpoint, edits, and continues.
+Each becomes a slice when we pick it, with its own gate.
 
-## M5 — The sidecar protocol
-
-**Goal.** An external process, in any language, can watch or intercept any hook point.
-
-**The contract.** A local socket. JSON control messages; tensors as Arrow or shared
-memory so they aren't copied. Each event carries the module path, the forward-pass ID and
-a typed tensor description.
-
-- **watch** is asynchronous. The sidecar receives the event; the run never waits.
-- **intercept** is synchronous. The run pauses until the sidecar answers with a
-  replacement tensor or a pass-through, or until its deadline passes. A missed deadline
-  is a recorded failure, never a silent pass-through.
-
-Every intercept is recorded: which sidecar acted, at what path, and what changed.
-Breakpoint edits from M3 and M4 go through the same intervention record.
-
-**Gate.** `just gate`, plus two reference sidecars against the real model: a watcher
-that logs every event, and an interceptor that applies a known edit and is shown to
-change the output.
-
-## M6 — Replay
-
-**Goal.** A recorded session replays into the TUI with the model off, exactly as it ran.
-
-**Crate-level changes.** `crates/sememe` adds the session-log reader and `Replayer`. A
-replay `Backend`, the same trait backed by the log instead of PyTorch, feeds `Harness`
-and the TUI unchanged.
-
-**What it requires.** A defined event order; tensor payloads that can be read back;
-the intervention decisions as recorded; and a backend that reproduces the TUI's state
-from the log alone.
-
-**Gate.** Its own proof, beyond `just gate`: record a session that includes breakpoints,
-edits and an intercept sidecar, replay it with the model off, and show the replayed TUI
-state equals the live one, event by event.
+- **Static model data across the bridge**: config, every parameter's shape, dtype and
+  count, weight stats. Feeds the sidebar and the Tables tab.
+- **Decode**: run a prompt, show tokens and the top-k next tokens.
+- **Monitoring for real**: prefill and decode timing and memory into the strip.
+- **Hooks at module paths**: observe a module's output during a forward pass. The bridge
+  owns hook lifetime: a forward that fails or is cancelled still removes every hook.
+- **Breakpoints**: pause at a module, inspect, edit, `step` or `continue`. The first
+  intervention is a whole-module output (zero or scale), shown downstream.
+- **Chart markers**: where a hook or edit acted, marked on the monitoring strip.
+- **Compare**: one prompt through two models, or two prompts through one, diffed by module.
+- **Sidecars**: external processes on a local socket. *watch* is asynchronous; *intercept*
+  pauses the run until the sidecar returns a replacement or a pass-through, or its deadline
+  passes (a missed deadline is a recorded failure). Each event carries the module path, a
+  forward-pass ID and a typed tensor description; every intercept is recorded with who
+  acted and what changed.
+- **Record and replay**: the recorder sidecar, then replay with its own proof — record a
+  session with breakpoints, edits and an intercept, replay it with the model off, and show
+  the replayed TUI state equals the live one, event by event.
+- **Per-head taps**: unverified. A head is not a module boundary once heads are combined;
+  the expected tap is a pre-forward hook on the attention output projection reshaped to
+  `[.., n_heads, head_dim]`. Not shown in the UI until Qwen3.5's real attention shapes are read.
