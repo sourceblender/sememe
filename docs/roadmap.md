@@ -4,10 +4,41 @@
 
 ## Status
 
-Early scaffold. The workspace builds; `crates/sememe` exposes `sememe::version()` and a
-placeholder `Harness`, and `apps/sememe-cli` prints it. There is **no PyTorch bridge yet** —
-no `Backend` seam and no implementation exist; nothing is observed or edited. M1 defines
-the seam and the core types. M2 wires the first real implementation.
+M1 and M2 are built. The core types, the live `Telemetry` hub and the record schema are
+pure Rust and tested. The PyO3 bridge loads a real PyTorch model and walks its
+`named_modules()`. M2.1 hardens that bridge. From here sememe grows slice by slice, starting with the
+TUI (see How we build from here). The first model is
+Qwen3.5-0.8B: same family and module layout as the larger Qwen3.5 models, small enough to
+test in seconds.
+
+## What sememe is
+
+A debugger for a model's forward pass, the way gdb is for a program. It is not an
+inference runtime and not a training tool. It exposes PyTorch's hook points so you can
+see what passes through any module, and change it to test a hypothesis about where a
+behaviour comes from. The goal is investigation that today's tooling doesn't reach: most
+LoRA and fine-tuning work happens downstream, but nothing says a change can't act inside
+the text encoder or any other module.
+
+Three verbs:
+
+- **Observe.** Hooks at any module path record what passes through: per-layer,
+  per-token stats, and full tensors when asked.
+- **Compare.** The same prompt through two models, or two prompts through one, diffed
+  module by module, to find where a fine-tune or a LoRA actually acts.
+- **Intervene.** Zero, scale or replace a module's output, swap a block from another
+  checkpoint, or add a delta at any module, then watch what changes downstream.
+
+Three ways in, all on the same hook points:
+
+- **Breakpoints.** `break <module path>` pauses the forward pass there. You inspect the
+  tensor, optionally edit it, then `step` to the next module or `continue`.
+- **Sidecars.** An external process binds to a hook point over a local socket, in any
+  language. A *watch* sidecar sees each event and never holds up the run. An *intercept*
+  sidecar pauses the run and must answer with a replacement or a pass-through before a
+  deadline. A LoRA delta on the text encoder, a probe, or a logger is just a sidecar.
+- **The TUI.** One client of the harness among others: module tree, tensor stats,
+  forward-pass timeline, breakpoints and sidecars.
 
 ## Non-goals
 
@@ -22,29 +53,15 @@ the seam and the core types. M2 wires the first real implementation.
 
 ## Record and replay
 
-Record and replay is the load-bearing feature that lets a user trust the harness on a
-real model. If every forward pass, every hook fire, and every edit can be logged, the
-same session replays into the TUI with the model off — exactly as it ran. The
-decomposition lands one piece per milestone; **M1 through M5 record events but cannot yet
-replay them. M6 is the first milestone that can replay.** Each milestone writes the
-events it can into the same log; M6 reads them back.
+Recording is cheap. The recorder is a built-in watch sidecar that writes every event to
+an NDJSON session log: model topology, forward passes, per-hook tensor observations, and
+every intervention with which breakpoint or sidecar made it and what changed.
 
-The log is NDJSON. Each line is a `RecordedEvent` (serde-tagged): model topology, forward
-passes, per-hook tensor observations, and edits at a module path. A `Recorder` writes it;
-a `Replayer` reads it. Both run on the same `Backend` seam — M6's trick is a `Backend` that
-replays from the log instead of running PyTorch, so the TUI and `Harness` are unchanged.
-The in-memory telemetry store from M1 stays as the fast path; M4's NDJSON writer mirrors
-it. Recording is intentionally cheaper than replay — no milestone gates on replay until
-M6.
-
-| Piece | Introduced | Notes |
-| --- | --- | --- |
-| Serializable record schema (serde-tagged `RecordedEvent`) | M1 | Pure Rust; the whole record format is this enum. |
-| Topology record (`ModuleTree`, once, at attach) | M2 | Recorded the first time a backend exposes its module tree. |
-| Observation records (per forward pass, per hook) | M3 | Streamed tensor records, written to the log as they fire. |
-| Persisted session-log sink (NDJSON writer) | M4 | Recording leaves the in-memory store and lands on disk. |
-| Edit records (path + `EditOp`, before / after) | M5 | Every applied edit becomes a log line. |
-| Session-log reader and `Replayer` | M6 | Full record **and** replay; the replay `Backend`. |
+Replay is not free, and it gets its own slice and proof. It needs a defined event order,
+tensor payloads that can be read back, the intervention decisions as recorded, and a
+model-off `Backend` that reproduces exactly the state the TUI showed. The record schema
+from M1 and the topology record from M2 already exist; the rest arrives with the features
+that produce it.
 
 ## M1 — Core types in pure Rust
 
@@ -124,127 +141,83 @@ replays it yet.
 --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace
 --all-features`) passes clean. The new crate is in `members`; the gate actually exercises it.
 
-## M3 — Bridge streams tensor records
+## M2.1 — The bridge proves what it claims
 
-**Goal.** A user can hook one module on a real model and watch a single forward pass
-emit tensor records end to end.
+**Goal.** The bridge's tests load the real model every time they run, and fail when they
+can't.
 
-**Crate-level changes.** `crates/sememe-bridge` now installs PyTorch forward hooks and
-streams `TensorView` records over a Rust channel on every hook fire. Arrow IPC carries
-the records across the PyO3 boundary (`arrow`, `arrow-pyarrow`). `crates/sememe` extends
-`Backend` with a forward method returning that channel and records each `TensorView` to
-the session log. No UI yet.
+**What changes.**
 
-**Public API surface (sketch)**.
+- A Rust-embedded interpreter adds `VIRTUAL_ENV`'s site-packages before importing
+  `transformers`. Before this, `cargo test` started the base Python, failed to import
+  `transformers`, printed "skipping" and passed. The Rust `PyBackend` had never loaded
+  the model under `just gate`.
+- The smoke tests never skip. A missing model or missing Python dependency fails them.
+- `named_modules` uses Python's iterator protocol, so only `StopIteration` ends the walk.
+  The old loop read any error as the end of the tree and returned a partial one.
+- `ModuleTree.root` is the model's class name, not the first child's first segment.
+- No machine-specific path in the repo. The test model comes from `SEMEME_TEST_MODEL`,
+  or `just test` resolves the cached Qwen3.5-0.8B snapshot offline. The same tests can
+  point at a larger Qwen model later.
 
-```rust
-pub struct ModelInput {
-    pub ids: Vec<i64>,
-    pub type_ids: Option<Vec<i64>>,
-}
+**Gate.** `just gate`, with the bridge tests loading Qwen3.5-0.8B. Each fix is
+red-proofed: putting the old behaviour back fails a test.
 
-impl Backend for crate::bridge::PyBackend {
-    fn named_modules(&self) -> Result<ModuleTree>;
-    fn run_forward(&self, input: &ModelInput) -> Result<Vec<TensorView>>;
-}
-```
+## How we build from here
 
-**Out of scope.** The stream is one direction: record and observe. No edits yet, no TUI
-to view the stream live, no replay. M3 records every hook fire into the session log but
-cannot persist to disk nor play anything back — recording lands in memory only. The tiny
-BERT-base used for the demo is a fixture for the demo, not a shipped fixture library.
+PyTorch's hook surface is too large to design up front, so sememe grows from the app
+outward. First a cockpit you can sit in front of, mocked where data doesn't exist yet;
+then real data, one panel at a time, each slice chosen from a real question asked while
+using it. A panel without real data says `MOCK` in its title, so nothing on screen
+pretends to be measured.
 
-**Gate.** The workspace `gate` passes clean, plus a check that the channel emits
-records for a hooked layer.
+## Slice 1 — The cockpit
 
-## M4 — TUI renders the live model
+**Goal.** Load Qwen3.5-0.8B and browse it as an architecture, with the whole layout in
+place.
 
-**Goal.** A human can watch the live model: navigate the module tree, read a selected
-module's tensor stats, and watch the hook and edit logs update.
+**Layout.**
 
-**Crate-level changes.** Adds `crates/sememe-tui` (ratatui): module tree on the left,
-selected module's tensor stats (shape, dtype, min / max / mean, sample values) in the
-middle, hook and edit log on the right, vim keys to navigate — rendering whatever a
-`Backend` streams. The new crate is added to the root `Cargo.toml` `members = [...]` so
-the workspace gate compiles and tests it. M4 also adds the persisted NDJSON session-log
-sink: recording leaves the in-memory store and lands on disk.
+- **Tabs**: Architecture, Tables, Decode. Hooks comes later.
+- **Architecture**: the model as blocks — embedding, the decoder blocks (each split into
+  attention and MLP), final norm and LM head, with the vision tower as a collapsed
+  branch. Color marks component type. Every block maps to a real module path.
+- **Sidebar**: the selected block's class, parameter shapes, dtypes and counts. Enter
+  drills into a block (attention's projections, the MLP's gate / up / down). Mouse and
+  keyboard select the same way.
+- **Search**: `/` jumps to a module by path.
+- **Monitoring strip**: a few lines at the bottom with running line charts for prefill
+  and decode throughput, per-step latency and memory. Not a benchmark: it's how you see
+  what a hook costs.
 
-**Public API surface (sketch).**
+**Real in slice 1**: the block map from the actual module paths, and the sidebar's static
+details. **Mocked**: Tables, Decode and the monitoring strip, until their slices land.
 
-```rust
-// crates/sememe-tui
-pub fn run(runtime, harness: &mut Harness<PyBackend>) -> Result<()>;
-//   left: tree  |  middle: TensorView stats  |  right: EditLog / hook stream
+**Gate.** `just gate`, plus render tests that run without a terminal (the view builds a
+plain render model; ratatui only draws it), and the real Qwen load.
 
-// Recording now persists:
-pub fn open_log(path: &Path) -> Recorder;   // NDJSON session writer
-```
+## Backlog, in rough order
 
-**Out of scope.** No edits are rendered or applied — the log is read-only on screen, and
-`EditOp` has not yet touched any backend. The TUI reads a live backend; it cannot yet
-replay a saved session (that is M6). M4 persists the session log to NDJSON, so every
-forward and hook fire is now recorded to disk — but the file is write-only this
-milestone.
+Each becomes a slice when we pick it, with its own gate.
 
-**Gate.** The workspace `gate` passes clean across all three crates; both new crates are
-registered in `members` before the gate runs.
-
-## M5 — Surgical edits end to end
-
-**Goal.** A user applies an `EditOp` at a named module path and watches the model's
-output change exactly as predicted.
-
-**Crate-level changes.** `crates/sememe` and `crates/sememe-bridge` add the mutation
-half: `Backend::edit` applies an `EditOp` at a `ModulePath` through the Python model, and
-the edit is recorded to the session log (path + op, with before / after stats).
-`crates/sememe-cli` gains the command that drives a live edit. M5 closes the loop the
-harness exists for.
-
-**Public API surface (sketch)**.
-
-```rust
-impl Backend for crate::bridge::PyBackend {
-    fn edit(&mut self, path: &ModulePath, op: &EditOp) -> Result<()>;
-}
-// Records the edit to the session log with before / after TensorViews.
-```
-
-**Out of scope.** The edit is applied in the live backend only — no editable TUI
-controls, and no editable backend in a replay. The verification is external: run a
-known-broken forward pass, apply an edit, watch the output change as predicted — a
-scripted check, not a general edit UI. One edit per path per forward for now; several
-simultaneous edits at one path are out.
-
-**Gate.** The workspace `gate` passes clean across all three crates, plus an end-to-end
-check that a known-broken forward changes as predicted after an edit.
-
-## M6 — Record / replay
-
-**Goal.** A full session can be saved to NDJSON and replayed into the TUI with the model
-off, exactly as it ran.
-
-**Crate-level changes.** `crates/sememe-bridge` gains a replay `Backend` — the same
-`Backend` trait, backed by the NDJSON session log instead of PyTorch — so `Harness` and
-the TUI are unchanged. `crates/sememe` adds the session-log reader and `Replayer`; the
-recorded events form a deterministic replay stream. No new crate: this wires the final
-implementation of the seam introduced in M1 and fed in M2 through M5.
-
-**Public API surface (sketch)**.
-
-```rust
-pub struct Replayer;                        // reads NDJSON, emits RecordedEvent
-pub struct ReplayBackend;                   // Backend backed by the replay stream
-impl Backend for ReplayBackend {
-    fn named_modules(&self) -> Result<ModuleTree>;    // from the topology record
-    fn run_forward(&self, input) -> Result<Vec<TensorView>>;  // from saved forwards
-    fn edit(&mut self, path, op) -> Result<()>;       // from saved edits
-}
-```
-
-**Out of scope.** Replay is exact, not editable live — it shows what ran, not a new run.
-It replays what was recorded; it does not record anything new. M6 is the first milestone
-that replays, and only then, after M1 through M5 have been recording every forward pass,
-hook fire, and edit.
-
-**Gate.** The workspace `gate` passes clean across every member, plus a round-trip: save
-a session and replay it back through `ReplayBackend` with the model off.
+- **Static model data across the bridge**: config, every parameter's shape, dtype and
+  count, weight stats. Feeds the sidebar and the Tables tab.
+- **Decode**: run a prompt, show tokens and the top-k next tokens.
+- **Monitoring for real**: prefill and decode timing and memory into the strip.
+- **Hooks at module paths**: observe a module's output during a forward pass. The bridge
+  owns hook lifetime: a forward that fails or is cancelled still removes every hook.
+- **Breakpoints**: pause at a module, inspect, edit, `step` or `continue`. The first
+  intervention is a whole-module output (zero or scale), shown downstream.
+- **Chart markers**: where a hook or edit acted, marked on the monitoring strip.
+- **Compare**: one prompt through two models, or two prompts through one, diffed by module.
+- **Sidecars**: external processes on a local socket. *watch* is asynchronous; *intercept*
+  pauses the run until the sidecar returns a replacement or a pass-through, or its deadline
+  passes (a missed deadline is a recorded failure). Each event carries the module path, a
+  forward-pass ID and a typed tensor description; every intercept is recorded with who
+  acted and what changed.
+- **Record and replay**: the recorder sidecar, then replay with its own proof — record a
+  session with breakpoints, edits and an intercept, replay it with the model off, and show
+  the replayed TUI state equals the live one, event by event.
+- **Per-head taps**: unverified. A head is not a module boundary once heads are combined;
+  the expected tap is a pre-forward hook on the attention output projection reshaped to
+  `[.., n_heads, head_dim]`. Not shown in the UI until Qwen3.5's real attention shapes are read.

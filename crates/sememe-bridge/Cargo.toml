@@ -1,0 +1,17 @@
+[package]
+name = "sememe-bridge"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "PyO3 bridge between sememe and a live PyTorch model."
+publish = false
+
+[lib]
+name = "sememe_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+sememe = { path = "../sememe" }
+thiserror = { workspace = true }
