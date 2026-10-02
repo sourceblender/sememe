@@ -539,7 +539,7 @@ class Cockpit(App):
         table = side.query_one("#side-params", DataTable)
         table.clear(columns=True)
         table.add_column("tensor", width=24 if side.size.width >= 50 else 14)
-        table.add_column("kind", width=5)
+        table.add_column("kind", width=6)
         table.add_column("shape", width=12)
         prefix = path + "." if path else ""
         owners = [m for m in self.info.modules if m.path == path or m.path.startswith(prefix)]

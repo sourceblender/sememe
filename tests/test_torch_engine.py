@@ -53,6 +53,7 @@ class TorchEngineTests(unittest.TestCase):
         self.assertEqual(layer.params[0].name, "weight")
         self.assertEqual(layer.params[0].shape, (2, 2))
         self.assertEqual(layer.params[0].bytes, 16)
+        self.assertEqual(layer.description, "in_features=2, out_features=2, bias=False")
 
     def test_stats_are_computed_only_when_requested(self) -> None:
         stats = self.engine.param_stats("layer", "weight")
