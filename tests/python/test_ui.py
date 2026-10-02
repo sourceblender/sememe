@@ -77,7 +77,7 @@ async def test_mocked_panels_say_so_and_tables_list_every_tensor():
 @pytest.mark.asyncio
 async def test_a_failed_load_is_shown_not_swallowed():
     class Broken(FakeEngine):
-        def load(self, model, progress=None):
+        def load(self, model, progress=None, cancelled=None):
             raise RuntimeError("no such snapshot")
 
     app = Cockpit(Broken(), "missing", mock=False)

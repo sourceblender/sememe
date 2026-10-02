@@ -335,6 +335,9 @@ class Cockpit(App):
 
     def start_load(self, ref: str, label: str, engine: Engine | None = None) -> None:
         self.load_token += 1
+        # Release the current model before its replacement allocates, so two
+        # models' weights are not held at once, and nothing of it stays on screen.
+        self.release_model()
         self.model_ref = label
         self.last_event = None
         self.w_title.update(Text.assemble(("loading ", "dim"), (label, "bold")))
@@ -352,7 +355,7 @@ class Cockpit(App):
             self.call_from_thread(self.on_load_event, token, event)
         try:
             engine = engine or self.engine_factory()  # in the worker: a missing torch is a load failure
-            info = engine.load(ref, progress)
+            info = engine.load(ref, progress, cancelled=lambda: token != self.load_token)
         except Exception as exc:  # the message is shown, never swallowed
             self.call_from_thread(self.load_failed, token, str(exc))
             return
@@ -396,8 +399,6 @@ class Cockpit(App):
         if token != self.load_token:
             _close(engine)  # superseded or closed while loading: never published
             return
-        if self.engine is not None and self.engine is not engine:
-            _close(self.engine)  # one loaded model at a time
         self.engine = engine
         self.info = info
         self.selected = None
@@ -416,19 +417,23 @@ class Cockpit(App):
         self.show_state("loaded")
 
     def close_model(self) -> None:
-        """Unload: drop every reference, invalidate any load in flight, go Off."""
+        """Unload: invalidate any load or stats in flight, drop every reference, go Off."""
         self.load_token += 1
+        self.release_model()
+        self.choice = None
+        self.model_ref = None
+        self.show_state("off")
+
+    def release_model(self) -> None:
+        """Close the loaded engine and clear everything drawn from its model."""
         if self.engine is not None:
             _close(self.engine)
         self.engine = None
         self.info = None
         self.selected = None
-        self.choice = None
-        self.model_ref = None
         self.query_one(BlockMap).remove_children()
         self.reset_sidebar()
         self.query_one("#all-params", DataTable).clear(columns=True)
-        self.show_state("off")
 
     def reset_sidebar(self) -> None:
         side = self.query_one(Sidebar)
@@ -511,17 +516,21 @@ class Cockpit(App):
         module = self.info.module(self.selected)
         if module is None or not module.params:
             return
+        if self.engine is None:
+            return
         self.query_one("#side-stats", Static).update(Text("reading weights…", style="dim"))
-        self.fetch_stats(module.path, module.params[0].name)
+        self.fetch_stats(self.engine, self.load_token, module.path, module.params[0].name)
 
     @work(thread=True, exclusive=True, group="stats")
-    def fetch_stats(self, path: str, tensor: str) -> None:
+    def fetch_stats(self, engine: Engine, token: int, path: str, tensor: str) -> None:
+        """Stats for one tensor of `engine`'s model. The answer is published only
+        if, by the time it arrives, that engine is still the loaded one (same
+        load token) and the same module is still selected: a slow answer from a
+        replaced or closed model must never land in the new model's sidebar."""
         try:
-            if self.engine is None:
-                raise EngineError("No model is loaded.")
-            stats = self.engine.param_stats(path, tensor)
+            stats = engine.param_stats(path, tensor)
         except (EngineError, Exception) as exc:
-            self.call_from_thread(self.query_one("#side-stats", Static).update, Text(str(exc), style="red"))
+            self.call_from_thread(self.publish_stats, engine, token, path, Text(str(exc), style="red"))
             return
         bars = "▁▂▃▄▅▆▇█"
         top = max(stats.histogram) or 1
@@ -530,8 +539,12 @@ class Cockpit(App):
         text = Text.assemble((f"{tensor}{tag}\n", "bold"),
                              f"μ {stats.mean:+.4f}  σ {stats.std:.4f}  min {stats.min:+.3f}  max {stats.max:+.3f}\n",
                              f"‖·‖₂ {stats.l2_norm:.2f}  zeros {stats.zero_fraction:.1%}  {hist}")
-        if path == self.selected:
-            self.call_from_thread(self.query_one("#side-stats", Static).update, text)
+        self.call_from_thread(self.publish_stats, engine, token, path, text)
+
+    def publish_stats(self, engine: Engine, token: int, path: str, text: Text) -> None:
+        if token != self.load_token or engine is not self.engine or path != self.selected:
+            return
+        self.query_one("#side-stats", Static).update(text)
 
     def action_menu(self) -> None:
         self.push_screen(ModelMenu(can_close=self.state != "off"), self.menu_chosen)

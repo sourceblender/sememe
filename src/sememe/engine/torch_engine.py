@@ -11,6 +11,7 @@ import math
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 from typing import Any
 
 from .api import EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, TensorInfo, TensorStats
@@ -25,7 +26,8 @@ class TorchEngine:
         self._info: ModelInfo | None = None
         self._torch: Any | None = None
 
-    def load(self, model: str | Path, progress: Progress | None = None) -> ModelInfo:
+    def load(self, model: str | Path, progress: Progress | None = None,
+             cancelled: Callable[[], bool] | None = None) -> ModelInfo:
         """Load weights and describe the model. Never runs a forward pass.
 
         Phases, each reported with a measured basis (see `LoadEvent`):
@@ -40,6 +42,12 @@ class TorchEngine:
         start = time.monotonic()
         clock = lambda: time.monotonic() - start  # noqa: E731
         phase = "import"
+        stop = cancelled or (lambda: False)
+
+        def check() -> None:
+            if stop():
+                raise EngineError(f"cancelled before {phase}: a newer load replaced this one")
+
         try:
             emit(LoadEvent("import", "importing torch and transformers", clock()))
             try:
@@ -59,11 +67,14 @@ class TorchEngine:
                 raise EngineError(f"Model directory does not exist: {model}")
 
             phase = "config"
+            check()
+            emit(LoadEvent("config", "reading config", clock()))
             config = AutoConfig.from_pretrained(identifier, trust_remote_code=False)
             emit(LoadEvent("config", f"config read: {type(config).__name__}", clock(), finished=True))
 
             phase = "install"
-            with _install_events(lambda done, total, name: emit(LoadEvent(
+            emit(LoadEvent("install", "installing parameters", clock()))
+            with _install_events(check, lambda done, total, name: emit(LoadEvent(
                     "install", "parameters installed", clock(), done=done, total=total,
                     unit="parameters", item=name, finished=done == total))) as seen:
                 loaded = AutoModel.from_pretrained(identifier, config=config, dtype="auto", trust_remote_code=False)
@@ -73,6 +84,7 @@ class TorchEngine:
             loaded.eval()
 
             phase = "inspect"
+            emit(LoadEvent("inspect", "enumerating modules", clock()))
             modules = dict(loaded.named_modules())
             info = ModelInfo(
                 class_name=type(loaded).__name__,
@@ -213,9 +225,10 @@ _INSTALL_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
-def _install_events(report):
+def _install_events(check, report):
     seen: list[int] = []
     with _INSTALL_LOCK:
+        check()  # a load that waited here behind another may be superseded by now
         try:
             import transformers.core_model_loading as loading
         except ImportError:  # a transformers without this module: no events

@@ -361,9 +361,9 @@ async def test_a_superseded_load_never_publishes(tmp_path, monkeypatch):
     release = threading.Event()
 
     class Slow(FakeEngine):
-        def load(self, model, progress=None):
+        def load(self, model, progress=None, cancelled=None):
             release.wait(5)
-            return super().load(model, progress)
+            return super().load(model, progress)  # deliberately ignores cancelled: the publish guard alone
 
     engines = []
 
@@ -396,3 +396,123 @@ def test_startup_labels_are_short():
     assert label_for(snap) == "Qwen/Qwen3.5-0.8B @ 2fc0636"
     assert label_for("/data/models/my-model") == "my-model"
     assert label_for("Qwen/Qwen3.5-0.8B") == "Qwen/Qwen3.5-0.8B"
+
+
+async def pick_qwen(pilot):
+    await pilot.press("f10", "enter")
+    await pilot.pause(0.2)
+    await pilot.press("enter")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["config", "install"])
+async def test_a_failure_is_blamed_on_the_phase_it_happened_in(tmp_path, monkeypatch, phase):
+    app = await cockpit_with((160, 50), tmp_path, monkeypatch, factory=lambda: FakeEngine(fail_in=phase))
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause(0.3)
+        await pick_qwen(pilot)
+        await until(pilot, lambda: app.state == "failed")
+        assert f"FAILED during {phase}: mock failure in {phase}" in log_text(app)
+        assert app.w_bar.total is None  # no count was ever reported, so no fraction is shown
+
+
+@pytest.mark.asyncio
+async def test_a_slow_answer_from_a_replaced_model_never_reaches_the_new_sidebar(tmp_path, monkeypatch):
+    import threading
+    from sememe.engine.api import TensorStats
+
+    release = threading.Event()
+
+    class SlowStats(FakeEngine):
+        def param_stats(self, module, tensor):
+            release.wait(5)
+            return TensorStats(min=0, max=1, mean=111.0, std=1, l2_norm=1, zero_fraction=0, histogram=(1,) * 16)
+
+    engines = []
+
+    def factory():
+        engines.append(SlowStats() if not engines else FakeEngine())
+        return engines[-1]
+
+    app = await cockpit_with((160, 50), tmp_path, monkeypatch, factory=factory)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause(0.3)
+        await pick_qwen(pilot)
+        await until(pilot, lambda: app.state == "loaded")
+        path = "language_model.layers.11.mlp.down_proj"
+        app.select(path)
+        await pilot.press("s")  # the old model's stats: blocked
+        await pilot.pause(0.1)
+        await pick_qwen(pilot)  # replace the model
+        await until(pilot, lambda: app.state == "loaded" and app.engine is engines[1])
+        app.select(path)  # same module path on the new model
+        release.set()
+        await pilot.pause(0.4)
+        assert "111.0000" not in str(app.query_one("#side-stats", Static).render())
+
+
+@pytest.mark.asyncio
+async def test_the_old_model_is_released_before_its_replacement_loads(tmp_path, monkeypatch):
+    import threading
+
+    release = threading.Event()
+
+    class Slow(FakeEngine):
+        def load(self, model, progress=None, cancelled=None):
+            release.wait(5)
+            return super().load(model, progress, cancelled)
+
+    engines = []
+
+    def factory():
+        engines.append(FakeEngine() if not engines else Slow())
+        return engines[-1]
+
+    app = await cockpit_with((160, 50), tmp_path, monkeypatch, factory=factory)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause(0.3)
+        await pick_qwen(pilot)
+        await until(pilot, lambda: app.state == "loaded")
+        await pick_qwen(pilot)  # second load blocks
+        await until(pilot, lambda: app.state == "loading")
+        assert engines[0]._info is None and app.engine is None and app.info is None  # released already
+        release.set()
+        await until(pilot, lambda: app.state == "loaded")
+        assert app.engine is engines[1]
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_load_stops_before_it_allocates(tmp_path, monkeypatch):
+    import threading
+
+    gate = threading.Event()
+    reached = []
+
+    class Waiting(FakeEngine):
+        def load(self, model, progress=None, cancelled=None):
+            gate.wait(5)  # like waiting behind the install lock
+            try:
+                return super().load(model, progress, cancelled)
+            except Exception as exc:
+                reached.append(str(exc))
+                raise
+
+    engines = []
+
+    def factory():
+        engines.append(Waiting() if not engines else FakeEngine())
+        return engines[-1]
+
+    folder = model_folder(tmp_path / "models" / "second")
+    app = await cockpit_with((160, 50), tmp_path, monkeypatch, factory=factory)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause(0.3)
+        await pick_qwen(pilot)
+        await until(pilot, lambda: app.state == "loading")
+        from sememe.sources import choice_for_path
+        app.model_chosen(choice_for_path(folder))
+        await until(pilot, lambda: app.state == "loaded")
+        gate.set()
+        await pilot.pause(0.3)
+        assert reached and reached[0].startswith("cancelled before config")
+        assert engines[0]._info is None and app.engine is engines[1]

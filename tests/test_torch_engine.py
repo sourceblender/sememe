@@ -87,12 +87,14 @@ class RealLoadEventTests(unittest.TestCase):
         original = loading.tqdm
         events = []
         info = TorchEngine().load(_cached_qwen(), events.append)
-        install = [e for e in events if e.phase == "install"]
+        install = [e for e in events if e.phase == "install" and e.done is not None]
         self.assertGreater(len(install), 1)
         self.assertEqual([e.done for e in install], list(range(1, install[-1].total + 1)))
         self.assertTrue(install[-1].finished and install[-1].unit == "parameters")
         self.assertEqual([e.phase for e in events if e.finished],
                          ["import", "config", "install", "inspect"])
+        starts = [e.phase for e in events if not e.finished and e.done is None]
+        self.assertEqual(starts, ["import", "config", "install", "inspect"])  # every phase opens before it works
         self.assertIs(loading.tqdm, original)
         self.assertGreater(info.param_count, 0)
 

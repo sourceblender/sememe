@@ -120,10 +120,14 @@ class Engine(Protocol):
     """What the UI may ask of a model. Every method may block; the UI calls
     them from a worker thread, never from its event loop."""
 
-    def load(self, model: str | Path, progress: Progress | None = None) -> ModelInfo:
+    def load(self, model: str | Path, progress: Progress | None = None,
+             cancelled: Callable[[], bool] | None = None) -> ModelInfo:
         """Load a model (a local snapshot directory or a Hub id) and describe it.
         Loading never runs the model. `progress` receives measured LoadEvents
-        from the worker thread that calls load."""
+        from the worker thread that calls load. Every phase opens with an
+        event before its work starts, so a failure is attributed to the phase
+        it happened in. `cancelled` is checked before expensive steps; a
+        superseded load stops there rather than allocating a model."""
         ...
 
     def model_info(self) -> ModelInfo:
