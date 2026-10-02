@@ -1,16 +1,29 @@
 [build-system]
-requires = ["maturin>=1.0"]
-build-backend = "maturin"
+requires = ["uv_build>=0.12.19,<0.13"]
+build-backend = "uv_build"
 
 [project]
-name = "sememe-bridge"
+name = "sememe"
 version = "0.0.0"
-description = "PyO3 bridge for the sememe debug harness."
-requires-python = ">=3.10"
-license = { text = "MIT" }
+description = "An interactive debugger for PyTorch models"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["textual>=8.2.8,<9"]
 
-[tool.maturin]
-manifest-path = "crates/sememe-bridge/Cargo.toml"
-module-name = "sememe_bridge"
-features = ["pyo3/abi3-py312"]
-strip = true
+[project.optional-dependencies]
+torch = [
+    "torch>=2.14,<3",
+    "transformers>=5.18,<6",
+    "huggingface-hub>=1.33,<2",
+]
+
+[project.scripts]
+sememe = "sememe.ui.app:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<9", "pytest-asyncio>=1,<2"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
