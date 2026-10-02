@@ -1,28 +1,37 @@
-//! End-to-end smoke test: load the real Qwen3.5-0.8B from the HF cache
-//! snapshot and walk its module tree through `PyBackend`. Run with
-//! `cargo test -p sememe-bridge --test smoke` from a venv where
-//! `transformers` and `torch` are installed.
+//! End-to-end smoke test: load a real model and walk its module tree
+//! through `PyBackend`.
+//!
+//! These tests never skip. A missing model or missing Python dependencies
+//! is a failure, because a test that passes without loading anything
+//! proves nothing. `just test` sets `VIRTUAL_ENV` to the project venv and
+//! `SEMEME_TEST_MODEL` to the cached Qwen3.5-0.8B snapshot; set
+//! `SEMEME_TEST_MODEL` yourself to try another model.
 
 use sememe::backend::Backend;
 use sememe_bridge::PyBackend;
 
-const DEMO_MODEL_PATH: &str = "/Users/ericmey/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
+fn model_path() -> String {
+    std::env::var("SEMEME_TEST_MODEL")
+        .expect("SEMEME_TEST_MODEL must name a model snapshot directory; `just test` sets it")
+}
+
+fn load() -> PyBackend {
+    let path = model_path();
+    PyBackend::load(&path).unwrap_or_else(|e| {
+        panic!("PyBackend::load({path}) failed; is VIRTUAL_ENV set to a venv with torch and transformers? {e}")
+    })
+}
 
 #[test]
 fn load_and_walk_qwen_module_tree() {
-    let backend = match PyBackend::load(DEMO_MODEL_PATH) {
-        Ok(b) => b,
-        Err(e) => {
-            // Skip gracefully if transformers/torch aren't installed in
-            // the active Python environment — keeps `cargo test --workspace`
-            // green on machines without the venv set up.
-            eprintln!("skipping: PyBackend::load failed (transformers/torch installed?): {e}");
-            return;
-        }
-    };
-
-    let tree = backend.named_modules().expect("named_modules");
+    let tree = load().named_modules().expect("named_modules");
     assert!(!tree.children.is_empty(), "expected non-empty tree");
+    // The root names the model, not its first child.
+    assert!(
+        tree.root.starts_with("Qwen"),
+        "root should be the model's class name; got {:?}",
+        tree.root
+    );
 
     // Qwen3.5-0.8B has a `visual` (vision tower) and `language_model`
     // (LLM half). The harness is for LLMs; both branches are valid
@@ -42,14 +51,7 @@ fn load_and_walk_qwen_module_tree() {
 
 #[test]
 fn unsupported_methods_surface_correctly() {
-    let backend = match PyBackend::load(DEMO_MODEL_PATH) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: {e}");
-            return;
-        }
-    };
-    let err = backend
+    let err = load()
         .run_forward(&sememe::ModelInput::from_ids(vec![1]))
         .expect_err("run_forward should fail in M2");
     assert!(matches!(err, sememe::Error::Unsupported(_)));

@@ -23,6 +23,14 @@ the hub in M3; the TUI renders the live hub in M4.
 # full gate: format check, clippy, tests, Python wheel build + smoke
 just gate
 
+# tests only; the bridge tests load a real model and fail without one
+just test
+```
+
+The bridge tests load `SEMEME_TEST_MODEL`, or the cached `Qwen/Qwen3.5-0.8B`
+snapshot when it isn't set (`huggingface-cli download Qwen/Qwen3.5-0.8B`).
+
+```sh
 # or just build the workspace
 cargo build --workspace
 ```
