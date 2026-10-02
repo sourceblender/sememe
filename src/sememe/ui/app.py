@@ -52,14 +52,19 @@ KIND_STYLE = {
     "vision": "#1e1e1e on #61afef",
     "other": "#d0d0d0 on #3e4451",
 }
+# Every row padded to one width: the off screen centres line by line, so rows
+# of different lengths would slide against each other and scramble the letters.
+_TITLE_ROWS = [
+    "███████ ███████ ███    ███ ███████ ███    ███ ███████",
+    "██      ██      ████  ████ ██      ████  ████ ██     ",
+    "███████ █████   ██ ████ ██ █████   ██ ████ ██ █████  ",
+    "     ██ ██      ██  ██  ██ ██      ██  ██  ██ ██     ",
+    "███████ ███████ ██      ██ ███████ ██      ██ ███████",
+]
+TITLE_WIDTH = max(len(row) for row in _TITLE_ROWS)
+TITLE_ART = "\n".join(row.ljust(TITLE_WIDTH) for row in _TITLE_ROWS)
 OFF_ART = Text.assemble(
-    ("""
-███████ ███████ ███    ███ ███████ ███    ███ ███████
-██      ██      ████  ████ ██      ████  ████ ██
-███████ █████   ██ ████ ██ █████   ██ ████ ██ █████
-     ██ ██      ██  ██  ██ ██      ██  ██  ██ ██
-███████ ███████ ██      ██ ███████ ██      ██ ███████
-""", "bold #56b6c2"),
+    (TITLE_ART + "\n", "bold #56b6c2"),
     ("\na debugger for a model's forward pass\n\n", "dim"),
     ("Model ▾", "bold"), ("  (F10)  →  Load Hugging Face Model…  or  Load Model from Disk…", ""),
 )
