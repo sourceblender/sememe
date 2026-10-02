@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/sememe",
     "crates/sememe-bridge",
+    "crates/sememe-tui",
     "apps/sememe-cli",
 ]
 

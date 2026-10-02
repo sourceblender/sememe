@@ -13,3 +13,5 @@ path = "src/main.rs"
 
 [dependencies]
 sememe = { path = "../../crates/sememe" }
+sememe-bridge = { path = "../../crates/sememe-bridge" }
+sememe-tui = { path = "../../crates/sememe-tui" }

@@ -40,3 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bridge module renamed to `_native` to avoid the maturin/Python
   source name collision; the wheel's Python `__init__.py` re-exports
   it as `sememe_bridge`.
+- M4 TUI: `crates/sememe-tui` (ratatui + crossterm). Three-pane
+  layout (tree | selected module's tensor stats | recent HubEvents),
+  vim keys (j/k, g/G, q), repaints on every `HubEvent` from the
+  harness's telemetry. NDJSON session-log sink writes each event to
+  disk as a serde-tagged `RecordedEvent` line. New `sememe tui`
+  subcommand in `apps/sememe-cli` loads the demo Qwen3.5-0.8B and
+  launches the TUI. Workspace deps `ratatui`, `crossterm`.

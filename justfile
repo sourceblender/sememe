@@ -38,6 +38,11 @@ build:
 run *ARGS:
     cargo run -p sememe-cli -- {{ ARGS }}
 
+# Launch the live TUI against the demo Qwen model. Requires the venv
+# and `just python-build` to have run.
+tui:
+    PYO3_PYTHON="$(pwd)/.venv/bin/python" cargo run -p sememe-cli -- tui
+
 # Apply formatting.
 fmt:
     cargo fmt --all

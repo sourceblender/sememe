@@ -11,12 +11,13 @@ and will change as M1 is built out; see the [changelog](./CHANGELOG.md).
 
 ## Status
 
-M3 is in. The workspace builds, the library exposes the core types, the
+M4 is in. The workspace builds, the library exposes the core types, the
 `Backend` seam, a `Telemetry` live hub with subscriber callbacks, and a
-PyO3 bridge (`crates/sememe-bridge`) that loads a real PyTorch model,
-walks `named_modules`, and now installs PyTorch forward hooks that
-stream `TensorView`s back across the boundary as Arrow IPC. M4 adds the
-ratatui TUI that renders the live hub.
+PyO3 bridge that loads a model, walks `named_modules`, and now installs
+PyTorch forward hooks that stream `TensorView`s back across the boundary
+as Arrow IPC. A ratatui TUI renders the live hub against any backend.
+`sememe tui` launches it against `Qwen/Qwen3.5-0.8B`. M5 adds
+`Backend::edit` and the CLI command that drives a live edit.
 
 ## Build
 
@@ -33,6 +34,9 @@ cargo build --workspace
 ```sh
 cargo run -p sememe-cli
 # → sememe 0.0.0
+
+# launch the live TUI against the demo Qwen3.5-0.8B
+just tui
 ```
 
 ## Python setup (M2+)
@@ -58,10 +62,13 @@ just python-build   # builds the wheel into the venv
   PyTorch forward hooks on every named module, runs one forward, and
   streams `TensorView`s back across the boundary as Arrow IPC.
   `edit` is stubbed until M5.
-- `apps/sememe-cli` — the `sememe` binary, which prints the version.
+- `crates/sememe-tui` — ratatui TUI with three panes (tree | selected
+  module's tensor stats | recent HubEvents), vim keys, NDJSON
+  session-log sink. Subscribes to the harness's telemetry and
+  repaints on every event.
+- `apps/sememe-cli` — `sememe --version` and `sememe tui`.
 
 ## What is not (yet)
 
-- A TUI that renders the hub live (M4).
 - Edit commands in the CLI (M5).
 - Replay of recorded sessions (M6).

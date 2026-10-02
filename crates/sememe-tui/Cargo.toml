@@ -1,0 +1,26 @@
+[package]
+name = "sememe-tui"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Ratatui-based TUI that renders the sememe live hub."
+publish = false
+
+[lib]
+name = "sememe_tui"
+path = "src/lib.rs"
+
+[dependencies]
+crossterm = "0.28"
+ratatui = "0.29"
+sememe = { path = "../sememe" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+test-util = ["sememe/test-util"]
+
+[[test]]
+name = "end_to_end"
+required-features = ["test-util"]
