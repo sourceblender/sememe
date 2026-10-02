@@ -11,6 +11,7 @@ license = { text = "MIT" }
 
 [tool.maturin]
 manifest-path = "crates/sememe-bridge/Cargo.toml"
-module-name = "sememe_bridge"
+module-name = "sememe_bridge._native"
+python-source = "bindings/python"
 features = ["pyo3/abi3-py312"]
 strip = true

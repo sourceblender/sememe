@@ -21,9 +21,10 @@ gate:
 python-build:
     .venv/bin/maturin develop
 
-# Smoke test that the wheel loads and `named_modules` returns a tree.
+# Smoke test that the wheel loads, walks the tree, and runs one forward
+# pass with hooks firing through Arrow IPC.
 python-smoke:
-    .venv/bin/python -c "import sememe_bridge as sb; m = sb.load(sb.demo_model_path()); names = m.named_modules(); assert len(names) > 0; print('full OK; modules:', len(names))"
+    .venv/bin/python -c "import sememe_bridge as sb; m = sb.load(sb.demo_model_path()); names = m.named_modules(); assert len(names) > 0; data = sb.run_forward_with_hooks(m, [101, 2024, 3056], names); assert len(data) > 1000; print('full OK; modules:', len(names), 'bytes:', len(data))"
 
 # Run all Python-side gates: build the wheel, then a smoke load. CI runs
 # this after `cargo test --workspace` so the gate is self-contained.

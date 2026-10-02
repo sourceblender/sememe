@@ -11,11 +11,12 @@ and will change as M1 is built out; see the [changelog](./CHANGELOG.md).
 
 ## Status
 
-M2 is in. The workspace builds, the library exposes the core types, the
+M3 is in. The workspace builds, the library exposes the core types, the
 `Backend` seam, a `Telemetry` live hub with subscriber callbacks, and a
-PyO3 bridge (`crates/sememe-bridge`) that loads a real PyTorch model via
-`transformers.AutoModel` and walks `named_modules`. Hooks stream into
-the hub in M3; the TUI renders the live hub in M4.
+PyO3 bridge (`crates/sememe-bridge`) that loads a real PyTorch model,
+walks `named_modules`, and now installs PyTorch forward hooks that
+stream `TensorView`s back across the boundary as Arrow IPC. M4 adds the
+ratatui TUI that renders the live hub.
 
 ## Build
 
@@ -53,14 +54,14 @@ just python-build   # builds the wheel into the venv
   `Backend` trait, an in-memory `Telemetry` hub with subscriber
   callbacks, and a generic `Harness<B>` that wires the two together.
 - `crates/sememe-bridge` — PyO3 bridge that loads a real PyTorch
-  model via `transformers.AutoModel` and implements `Backend::
-  named_modules`. `run_forward` and `edit` are stubbed until M3 and
-  M5.
+  model via `transformers.AutoModel`, walks `named_modules`, installs
+  PyTorch forward hooks on every named module, runs one forward, and
+  streams `TensorView`s back across the boundary as Arrow IPC.
+  `edit` is stubbed until M5.
 - `apps/sememe-cli` — the `sememe` binary, which prints the version.
 
 ## What is not (yet)
 
-- Hooks that stream observations from a live forward pass (M3).
 - A TUI that renders the hub live (M4).
 - Edit commands in the CLI (M5).
 - Replay of recorded sessions (M6).

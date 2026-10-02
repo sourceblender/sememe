@@ -12,6 +12,7 @@ name = "sememe_bridge"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+arrow = { workspace = true }
 pyo3 = { workspace = true }
 sememe = { path = "../sememe" }
 thiserror = { workspace = true }

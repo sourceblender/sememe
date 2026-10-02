@@ -31,3 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Python smoke test loads the demo `Qwen/Qwen3.5-0.8B` snapshot and
   asserts the module tree includes both `language_model` and `visual`
   branches.
+- M3 hook firing: `run_forward_with_hooks` installs PyTorch forward
+  hooks on every named module, runs one pass, and returns the captured
+  `TensorView` stats as Arrow IPC bytes. Rust decodes via Arrow's
+  `StreamReader`. `Backend::run_forward` is now live end to end against
+  a real model. Hub `HubEvent::Observation` events fire as each view
+  lands. Workspace dep `arrow` (ipc only, default-features = false).
+- Bridge module renamed to `_native` to avoid the maturin/Python
+  source name collision; the wheel's Python `__init__.py` re-exports
+  it as `sememe_bridge`.
