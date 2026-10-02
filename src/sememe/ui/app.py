@@ -36,7 +36,7 @@ from textual.widgets import (
     Tree,
 )
 
-from sememe.engine.api import Engine, EngineError, LoadEvent, ModelInfo, ModuleInfo
+from sememe.engine.api import Engine, EngineError, LoadEvent, ModelInfo, ModuleInfo, TensorInfo
 from sememe.sources import ModelChoice, label_for
 from sememe.ui.picker import CLOSE_MODEL, LOAD_DISK, LOAD_HF, ModelMenu, DiskPicker, HubPicker, MenuBar, describe
 
@@ -157,14 +157,23 @@ class Cell(Static):
 class BlockMap(VerticalScroll):
     """The model drawn as an architecture: embedding, decoder layers, norm."""
 
+    def on_resize(self, event) -> None:
+        for grid in self.query(Grid):
+            grid.styles.grid_size_columns = max(1, min(6, (event.size.width - 2) // 14))
+
     def show(self, info: ModelInfo) -> None:
         self.remove_children()
-        widgets: list = []
+        widgets: list = [Static(Text("Structure overview · colours identify module types, not activity", style="dim"))]
+        if not decoder_layers(info):
+            widgets.append(Label("model components · complete hierarchy in Modules", classes="section"))
+            widgets.extend(Cell(f" {m.path} · {m.class_name} ", m) for m in info.children(""))
+            self.mount_all(widgets)
+            return
         vision = info.module("visual")
         if vision is not None:
             widgets.append(Label("vision tower", classes="section"))
             widgets.append(Cell(f" {vision.class_name} · {human(info.subtree_param_count('visual'))} ▸ ", vision))
-        widgets.append(Label("language model", classes="section"))
+        widgets.append(Label("language model · overview; all modules in Modules", classes="section"))
         embed = next((m for m in info.modules if kind_of(m) == "embed" and not m.path.startswith("visual")), None)
         if embed is not None:
             widgets.append(Cell(f" embed_tokens {'×'.join(map(str, embed.params[0].shape))} ", embed))
@@ -197,18 +206,25 @@ class BlockMap(VerticalScroll):
         self.mount(Static(legend, classes="legend"))
 
 
-class Sidebar(Vertical):
+class Sidebar(VerticalScroll):
     """What the selected module is, what it owns, and its subtree."""
 
     def compose(self) -> ComposeResult:
+        with Horizontal(id="inspector-nav"):
+            yield Button("↑ Parent", id="side-parent", disabled=True)
+            yield Label("Inspect", id="inspector-label")
         yield Static("select a block", id="side-title")
         yield DataTable(id="side-params", cursor_type="row")
+        yield Static("select a tensor", id="side-tensor")
+        yield Button("Measure distribution (s)", id="side-measure", disabled=True)
         yield Static("", id="side-stats")
         yield Tree("subtree", id="side-tree")
 
     def on_mount(self) -> None:
         table = self.query_one("#side-params", DataTable)
-        table.add_columns("tensor", "shape", "dtype", "count")
+        table.add_column("tensor", width=20)
+        table.add_column("kind", width=6)
+        table.add_column("shape", width=12)
 
 
 class Cockpit(App):
@@ -220,20 +236,29 @@ class Cockpit(App):
     #main { height: 1fr; }
     BlockMap { width: 1fr; padding: 0 1; }
     Sidebar { width: 56; border-left: solid $accent; padding: 0 1; }
+    #cockpit { height: 1fr; }
+    #inspector-nav { height: 1; }
+    #inspector-nav Button { height: 1; min-width: 0; border: none; padding: 0 1; }
+    #inspector-label { width: 1fr; text-align: right; color: $text-muted; }
+    #side-tensor { height: auto; margin-top: 1; }
+    #side-measure { height: 1; min-width: 0; border: none; padding: 0 1; margin-top: 1; }
+    #model-tree { height: 1fr; }
+    #model-summary { height: auto; margin: 0 1 1 1; }
+    .selected-block { text-style: bold reverse; }
     .section { color: $text-muted; margin-top: 1; }
     .layers { grid-size: 6; grid-gutter: 0 1; height: auto; }
     .layer { height: 4; border: round $panel-lighten-2; }
     .layer-title { color: $text-muted; }
     .layer-row { height: 1; }
     .layer-row Cell { margin-right: 1; }
-    #tabs { height: 1fr; }
+    #tabs { height: 1fr; width: 1fr; }
     Cell { width: auto; height: 1; }
     Cell:focus { text-style: reverse; }
     .legend { margin-top: 1; }
     #side-title { height: auto; margin-bottom: 1; }
-    #side-params { height: auto; max-height: 12; }
+    #side-params { height: auto; max-height: 8; }
     #side-stats { height: auto; margin: 1 0; }
-    #side-tree { height: 1fr; }
+    #side-tree { height: 12; }
     #search { display: none; dock: top; }
     #search.open { display: block; }
     #monitor { height: 6; border-top: solid $accent; }
@@ -273,6 +298,9 @@ class Cockpit(App):
         self.engine: Engine | None = None  # the engine whose model is loaded
         self.model_ref: str | None = None
         self.info: ModelInfo | None = None
+        self.selected_tensor: tuple[str, str] | None = None
+        self.inspection_token = 0
+        self.tensor_rows: dict[str, tuple[str, str, TensorInfo]] = {}
         self.selected: str | None = None
         self.choice: ModelChoice | None = None  # what the Model menu picked
         self.state = "off"  # off | loading | loaded | failed
@@ -291,21 +319,27 @@ class Cockpit(App):
                 yield ProgressBar(id="load-bar", show_eta=False)
                 yield Static("", id="load-basis")
                 yield RichLog(id="load-log", markup=False, wrap=True)
-            with TabbedContent(id="tabs"):
-                with TabPane("Architecture", id="tab-arch"):
-                    with Horizontal(id="main"):
+            with Horizontal(id="cockpit"):
+                with TabbedContent(id="tabs"):
+                    with TabPane("Architecture", id="tab-arch"):
                         yield BlockMap(id="blockmap")
-                        yield Sidebar(id="sidebar")
-                with TabPane("Tables", id="tab-tables"):
-                    yield DataTable(id="all-params", cursor_type="row", zebra_stripes=True)
-                with TabPane("Decode — MOCK", id="tab-decode"):
-                    yield Static(id="decode")
+                    with TabPane("Modules", id="tab-modules"):
+                        yield Static("", id="model-summary")
+                        yield Tree("model", id="model-tree")
+                    with TabPane("Tables", id="tab-tables"):
+                        yield DataTable(id="all-params", cursor_type="row", zebra_stripes=True)
+                    with TabPane("Decode — MOCK", id="tab-decode"):
+                        yield Static(id="decode")
+                yield Sidebar(id="sidebar")
         with Horizontal(id="monitor"):
             for name, (label, _) in MONITOR.items():
                 with Vertical():
                     yield Label(f"{label} — MOCK", id=f"mon-{name}-label")
                     yield Sparkline(list(self.series[name]), id=f"mon-{name}")
         yield Footer()
+
+    def on_resize(self, event) -> None:
+        self.query_one(Sidebar).styles.width = 42 if event.size.width < 110 else 56
 
     def on_mount(self) -> None:
         # Held, not queried per tick: a tick that lands while the app is shutting
@@ -331,8 +365,8 @@ class Cockpit(App):
 
     def show_state(self, state: str) -> None:
         self.state = state
-        self.query_one("#stage", ContentSwitcher).current = {"off": "off", "loaded": "tabs"}.get(state, "loading")
-        self.query_one("#monitor").display = state == "loaded"
+        self.query_one("#stage", ContentSwitcher).current = {"off": "off", "loaded": "cockpit"}.get(state, "loading")
+        self.query_one("#monitor").display = state == "loaded" and self.mock
         self.query_one("#menu-selection", Static).update(describe(self.model_ref, state))
         self.query_one("#menu-play", Button).disabled = state != "loaded"
         if state == "off":
@@ -411,15 +445,38 @@ class Cockpit(App):
         self.sub_title = f"{info.class_name} · {len(info.modules)} modules · {human(info.param_count)} params{tag}"
         self.query_one(BlockMap).show(info)
         self.reset_sidebar()
+        self.show_hierarchy(info)
         table = self.query_one("#all-params", DataTable)
         table.clear(columns=True)
         table.add_columns("module", "tensor", "kind", "shape", "dtype", "count", "bytes")
+        self.all_tensor_rows = {}
         for module in info.modules:
             for kind, tensors in (("param", module.params), ("buffer", module.buffers)):
                 for t in tensors:
                     table.add_row(module.path or "<root>", t.name, kind, "×".join(map(str, t.shape)),
-                                  t.dtype.removeprefix("torch."), f"{t.numel:,}", human(t.bytes))
+                                  t.dtype.removeprefix("torch."), f"{t.numel:,}", human(t.bytes),
+                                  key=str(len(self.all_tensor_rows)))
+                    self.all_tensor_rows[str(len(self.all_tensor_rows))] = (module.path, t.name)
         self.show_state("loaded")
+        self.select("")
+
+    def show_hierarchy(self, info: ModelInfo) -> None:
+        tag = "MOCK" if self.mock else "Loaded model · no forward pass"
+        self.query_one("#model-summary", Static).update(Text(
+            f"{tag}\n{info.class_name} · {len(info.modules):,} modules · {info.param_count:,} parameter entries\nModule ownership hierarchy; not an execution trace.", style="dim"))
+        tree = self.query_one("#model-tree", Tree)
+        tree.clear()
+        tree.root.set_label(info.class_name)
+        tree.root.data = ""
+        nodes = {"": tree.root}
+        for module in info.modules:
+            if not module.path:
+                continue
+            parent = module.path.rpartition(".")[0]
+            label = Text.assemble((module.path.rsplit(".", 1)[-1], "bold"),
+                                  f" · {module.class_name} · {human(info.subtree_param_count(module.path))} params")
+            nodes[module.path] = nodes[parent].add(label, data=module.path, allow_expand=bool(info.children(module.path)))
+        tree.root.expand()
 
     def close_model(self) -> None:
         """Unload: invalidate any load or stats in flight, drop every reference, go Off."""
@@ -438,10 +495,18 @@ class Cockpit(App):
         self.selected = None
         self.query_one(BlockMap).remove_children()
         self.reset_sidebar()
+        self.query_one("#model-tree", Tree).clear()
+        self.query_one("#model-summary", Static).update("")
         self.query_one("#all-params", DataTable).clear(columns=True)
 
     def reset_sidebar(self) -> None:
+        self.inspection_token += 1
+        self.selected_tensor = None
+        self.tensor_rows = {}
         side = self.query_one(Sidebar)
+        side.query_one("#side-parent", Button).disabled = True
+        side.query_one("#side-measure", Button).disabled = True
+        side.query_one("#side-tensor", Static).update("select a tensor")
         side.query_one("#side-title", Static).update("select a block")
         side.query_one("#side-params", DataTable).clear()
         side.query_one("#side-stats", Static).update("")
@@ -458,36 +523,61 @@ class Cockpit(App):
         if module is None:
             return
         self.selected = path
+        self.inspection_token += 1
+        self.selected_tensor = None
+        self.tensor_rows = {}
         side = self.query_one(Sidebar)
+        side.scroll_home(animate=False)
+        side.query_one("#side-parent", Button).disabled = path == ""
+        side.query_one("#side-measure", Button).disabled = True
+        tag = "MOCK" if self.mock else "loaded metadata"
         side.query_one("#side-title", Static).update(Text.assemble(
-            (f"{path or '<root>'}\n", "bold"), (f"{module.class_name}", KIND_STYLE[kind_of(module)]),
-            f"  ·  own {human(module.own_param_count)}  ·  subtree {human(self.info.subtree_param_count(path))}"))
+            (f"{path or '<root>'}\n", "bold"), (f"{module.class_name}\n", KIND_STYLE[kind_of(module)]),
+            f"own {module.own_param_count:,} · subtree {self.info.subtree_param_count(path):,} params\n",
+            (f"{tag} · no forward pass", "dim"),
+            (f"\n{module.description}" if module.description else "", "")))
         table = side.query_one("#side-params", DataTable)
-        table.clear()
-        for t in module.params + module.buffers:
-            table.add_row(t.name, "×".join(map(str, t.shape)), t.dtype.removeprefix("torch."), human(t.numel))
-        side.query_one("#side-stats", Static).update(
-            Text("press s for weight stats" if module.params else "no parameters of its own", style="dim"))
+        table.clear(columns=True)
+        table.add_column("tensor", width=24 if side.size.width >= 50 else 14)
+        table.add_column("kind", width=5)
+        table.add_column("shape", width=12)
+        prefix = path + "." if path else ""
+        owners = [m for m in self.info.modules if m.path == path or m.path.startswith(prefix)]
+        for owner in owners:
+            for kind, tensors in (("parameter", owner.params), ("buffer", owner.buffers)):
+                for tensor in tensors:
+                    relative = owner.path[len(prefix):] if owner.path != path else ""
+                    address = f"{relative}.{tensor.name}" if relative else tensor.name
+                    key = str(len(self.tensor_rows))
+                    self.tensor_rows[key] = (owner.path, kind, tensor)
+                    table.add_row(address, "param" if kind == "parameter" else "buffer", "×".join(map(str, tensor.shape)) or "scalar", key=key)
+        side.query_one("#side-tensor", Static).update(Text("Choose a tensor above to inspect its metadata.", style="dim"))
+        side.query_one("#side-stats", Static).update("")
+        for cell in self.query(Cell):
+            cell.set_class(cell.module_path == path, "selected-block")
+        # A leaf has one obvious weight; preserve search → s while parents require a choice.
+        if len(self.tensor_rows) == 1:
+            self.select_tensor("0")
         tree = side.query_one("#side-tree", Tree)
         tree.clear()
         tree.root.set_label(path.rsplit(".", 1)[-1] or "<root>")
         tree.root.data = path
-        self._grow(tree.root, path, depth=0)
+        self._grow(tree.root, path)
         tree.root.expand()
 
-    def _grow(self, node, path: str, depth: int) -> None:
+    def _grow(self, node, path: str) -> None:
         assert self.info is not None
         for child in self.info.children(path):
             leaf = child.path.rsplit(".", 1)[-1]
             label = Text.assemble((f" {leaf} ", KIND_STYLE[kind_of(child)]), f" {child.class_name}")
             kids = self.info.children(child.path)
             branch = node.add(label, data=child.path) if kids else node.add_leaf(label, data=child.path)
-            if kids and depth < 2:
-                self._grow(branch, child.path, depth + 1)
+            if kids:
+                self._grow(branch, child.path)
 
     @on(Tree.NodeSelected, "#side-tree")
     def drill(self, event: Tree.NodeSelected) -> None:
-        if event.node.data and event.node.data != self.selected:
+        if event.node.data is not None and event.node.data != self.selected:
             self.select(event.node.data)
 
     def action_search(self) -> None:
@@ -515,39 +605,80 @@ class Cockpit(App):
         self.query_one("#tabs", TabbedContent).active = "tab-arch"
         self.select(hit.path)
 
+    @on(Tree.NodeSelected, "#model-tree")
+    def hierarchy_selected(self, event: Tree.NodeSelected) -> None:
+        if event.node.data is not None:
+            self.select(event.node.data)
+
+    @on(Button.Pressed, "#side-parent")
+    def parent_selected(self) -> None:
+        if self.selected:
+            self.select(self.selected.rpartition(".")[0])
+
+    @on(DataTable.RowSelected, "#side-params")
+    def tensor_selected(self, event: DataTable.RowSelected) -> None:
+        self.select_tensor(str(event.row_key.value))
+
+    @on(DataTable.RowSelected, "#all-params")
+    def table_selected(self, event: DataTable.RowSelected) -> None:
+        owner, name = self.all_tensor_rows[str(event.row_key.value)]
+        self.select(owner)
+        key = next(k for k, (path, _, tensor) in self.tensor_rows.items() if path == owner and tensor.name == name)
+        self.select_tensor(key)
+
+    def select_tensor(self, key: str) -> None:
+        if key not in self.tensor_rows:
+            return
+        path, kind, tensor = self.tensor_rows[key]
+        self.inspection_token += 1
+        self.selected_tensor = (path, tensor.name)
+        self.query_one("#side-params", DataTable).move_cursor(row=int(key))
+        address = f"{path}.{tensor.name}" if path else tensor.name
+        tag = "MOCK metadata" if self.mock else "loaded tensor metadata"
+        self.query_one("#side-tensor", Static).update(Text.assemble(
+            (address + "\n", "bold"),
+            f"{kind} · {' × '.join(map(str, tensor.shape)) or 'scalar'}\n",
+            f"{tensor.dtype.removeprefix('torch.')} · {tensor.device}\n",
+            f"{tensor.numel:,} values · {tensor.bytes:,} bytes\n",
+            (f"{tag}\nLogical tensor size; not resident memory.", "dim")))
+        self.query_one("#side-stats", Static).update("")
+        self.query_one("#side-measure", Button).disabled = tensor.numel == 0 or tensor.device == "meta"
+
+    @on(Button.Pressed, "#side-measure")
+    def measure_selected(self) -> None:
+        self.action_stats()
+
     def action_stats(self) -> None:
-        if self.selected is None or self.info is None:
+        if self.selected_tensor is None or self.engine is None:
+            self.notify("Choose a tensor in the inspector first.")
             return
-        module = self.info.module(self.selected)
-        if module is None or not module.params:
-            return
-        if self.engine is None:
-            return
-        self.query_one("#side-stats", Static).update(Text("reading weights…", style="dim"))
-        self.fetch_stats(self.engine, self.load_token, module.path, module.params[0].name)
+        self.query_one("#side-stats", Static).update(Text("reading selected tensor values…", style="dim"))
+        self.fetch_stats(self.engine, self.load_token, self.inspection_token, *self.selected_tensor)
 
     @work(thread=True, exclusive=True, group="stats")
-    def fetch_stats(self, engine: Engine, token: int, path: str, tensor: str) -> None:
+    def fetch_stats(self, engine: Engine, token: int, inspection: int, path: str, tensor: str) -> None:
         """Stats for one tensor of `engine`'s model. The answer is published only
         if, by the time it arrives, that engine is still the loaded one (same
-        load token) and the same module is still selected: a slow answer from a
+        load token) and the same tensor selection is still current: a slow answer from a
         replaced or closed model must never land in the new model's sidebar."""
         try:
             stats = engine.param_stats(path, tensor)
         except (EngineError, Exception) as exc:
-            self.call_from_thread(self.publish_stats, engine, token, path, Text(str(exc), style="red"))
+            self.call_from_thread(self.publish_stats, engine, token, inspection, path, tensor, Text(str(exc), style="red"))
             return
         bars = "▁▂▃▄▅▆▇█"
         top = max(stats.histogram) or 1
         hist = "".join(bars[min(7, int(7 * h / top))] for h in stats.histogram)
         tag = "  MOCK" if self.mock else ""
+        basis = "Synthetic values — MOCK" if self.mock else "Measured values; no forward pass."
         text = Text.assemble((f"{tensor}{tag}\n", "bold"),
                              f"μ {stats.mean:+.4f}  σ {stats.std:.4f}  min {stats.min:+.3f}  max {stats.max:+.3f}\n",
-                             f"‖·‖₂ {stats.l2_norm:.2f}  zeros {stats.zero_fraction:.1%}  {hist}")
-        self.call_from_thread(self.publish_stats, engine, token, path, text)
+                             f"‖·‖₂ {stats.l2_norm:.2f}  zeros {stats.zero_fraction:.1%}\n{hist}\n16 equal-width bins over [min, max]\n{basis}")
+        self.call_from_thread(self.publish_stats, engine, token, inspection, path, tensor, text)
 
-    def publish_stats(self, engine: Engine, token: int, path: str, text: Text) -> None:
-        if token != self.load_token or engine is not self.engine or path != self.selected:
+    def publish_stats(self, engine: Engine, token: int, inspection: int, path: str, tensor: str, text: Text) -> None:
+        if (token != self.load_token or engine is not self.engine or inspection != self.inspection_token
+                or (path, tensor) != self.selected_tensor):
             return
         self.query_one("#side-stats", Static).update(text)
 

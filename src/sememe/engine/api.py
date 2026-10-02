@@ -38,6 +38,7 @@ class ModuleInfo:
     class_name: str  # e.g. "Qwen3_5Attention", "Linear"
     params: tuple[TensorInfo, ...] = ()
     buffers: tuple[TensorInfo, ...] = ()
+    description: str = ""  # backend module.extra_repr(), not an inferred role
 
     @property
     def own_param_count(self) -> int:

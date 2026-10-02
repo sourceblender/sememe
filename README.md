@@ -9,6 +9,14 @@ comes from.
 It is a working environment for experiments, not a product. The API is small
 and will change as M1 is built out; see the [changelog](./CHANGELOG.md).
 
+## Current Python cockpit
+
+Run `sememe` to select and load a local model, or `sememe --mock` for the
+synthetic preview. Architecture, Modules and Tables share a selected-component
+inspector. See [Inspecting a loaded model](docs/model-inspector.md) for the
+current controls and the distinction between model structure, measured weights
+and mock panels. The historical Rust prototype is described below.
+
 ## Status
 
 M2 is in. The workspace builds, the library exposes the core types, the
