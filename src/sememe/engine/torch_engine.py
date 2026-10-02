@@ -175,7 +175,7 @@ class TorchEngine:
             try:
                 path = str(write_record(attempt, status=status, error=message, phase=phase))
                 return RunFailed(message, run_id, status, path)
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 return RunFailed(message, run_id, status, None, f"record not saved: {exc}")
 
         if full is None or tokenizer is None or torch is None:
@@ -233,11 +233,23 @@ class TorchEngine:
         if stop():
             raise fail("cancelled after the forward pass; the result was discarded", "cancelled", "forward")
         t0 = time.monotonic()
-        last = logits[0, -1].float()
-        probs = torch.softmax(last, dim=-1)
-        top_p, top_i = torch.topk(probs, min(settings.top_k, probs.shape[-1]))
-        candidates = tuple(Candidate(int(i), tokenizer.decode([int(i)]), float(p), float(last[int(i)]))
-                           for p, i in zip(top_p, top_i))
+        try:
+            last = logits[0, -1].float()
+            if not bool(torch.isfinite(last).all()):
+                bad = int((~torch.isfinite(last)).sum())
+                raise fail(f"the model produced {bad:,} non-finite logits at the final position; no probabilities "
+                           "can be computed", "failed", "score")
+            probs = torch.softmax(last, dim=-1)
+            if not bool(torch.isfinite(probs).all()):
+                raise fail("the softmax over the final position is not finite", "failed", "score")
+            top_p, top_i = torch.topk(probs, min(settings.top_k, probs.shape[-1]))
+            candidates = tuple(Candidate(int(i), tokenizer.decode([int(i)]), float(p), float(last[int(i)]))
+                               for p, i in zip(top_p, top_i))
+        except RunFailed:
+            raise
+        except Exception as exc:  # malformed logits, a decode error: recorded, never an unrecorded escape
+            timing["score"] = time.monotonic() - t0
+            raise fail(f"scoring failed: {exc}", "failed", "score") from exc
         timing["score"] = time.monotonic() - t0
         used = {
             "device": str(device),
@@ -257,7 +269,7 @@ class TorchEngine:
                            settings=settings, used=used, model=identity, timing=timing)
         try:
             return dataclasses.replace(result, record_path=str(write_record(result)))
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             return dataclasses.replace(result, record_error=f"record not saved: {exc}")
 
     def close(self) -> None:

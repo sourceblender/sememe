@@ -43,6 +43,8 @@ def write_record(result: Any, status: str = "ok", **extra: Any) -> Path:
     folder.mkdir(parents=True, exist_ok=False)
     path = folder / "record.json"
     tmp = folder / "record.json.tmp"
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    # allow_nan=False: a NaN or infinity is never written into a record as if it
+    # were a number; it raises ValueError and the caller reports "not saved".
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str, allow_nan=False))
     tmp.replace(path)  # never a half-written record under the final name
     return path

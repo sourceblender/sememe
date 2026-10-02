@@ -74,6 +74,63 @@ if __name__ == "__main__":
     unittest.main()
 
 
+@unittest.skipIf(torch is None, "install sememe[torch] for engine tests")
+class NonFiniteScoreTests(unittest.TestCase):
+    """A run whose final-position logits are not finite must fail in phase
+    score, with an attempt record, never succeed with NaN probabilities."""
+
+    def _engine(self, logits):
+        import tempfile
+
+        class Fixed(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.zeros(1))
+
+            def forward(self, input_ids=None, attention_mask=None, use_cache=None):
+                return types.SimpleNamespace(logits=torch.tensor([[logits]]))
+
+        class OneToken:
+            def __call__(self, text, return_tensors=None):
+                return {"input_ids": torch.tensor([[1]])}
+
+            def decode(self, ids):
+                return f"<{ids[0]}>"
+
+        engine = TorchEngine()
+        engine._full, engine._tokenizer, engine._torch, engine._identity = Fixed(), OneToken(), torch, {}
+        self.runs = tempfile.TemporaryDirectory()
+        self.addCleanup(self.runs.cleanup)
+        env = patch.dict("os.environ", {"SEMEME_RUNS_DIR": self.runs.name})
+        env.start()
+        self.addCleanup(env.stop)
+        return engine
+
+    def test_nan_logits_fail_in_score_and_are_recorded(self) -> None:
+        import json
+        from sememe.engine.api import RunFailed, RunSettings
+        engine = self._engine([float("nan"), 1.0, 2.0])
+        with self.assertRaises(RunFailed) as caught:
+            engine.run("x", RunSettings(top_k=1))
+        self.assertEqual(caught.exception.status, "failed")
+        self.assertIn("non-finite logits", str(caught.exception))
+        record = json.loads(Path(caught.exception.record_path).read_text())
+        self.assertEqual((record["status"], record["phase"]), ("failed", "score"))
+        self.assertEqual(record["candidates"], [])
+
+    def test_infinite_logits_fail_the_same_way(self) -> None:
+        from sememe.engine.api import RunFailed, RunSettings
+        with self.assertRaises(RunFailed) as caught:
+            self._engine([float("inf"), 1.0, 2.0]).run("x", RunSettings(top_k=1))
+        self.assertIn("non-finite", str(caught.exception))
+
+    def test_finite_logits_still_succeed(self) -> None:
+        from sememe.engine.api import RunSettings
+        result = self._engine([0.0, 1.0, 2.0]).run("x", RunSettings(top_k=1))
+        self.assertEqual(result.candidates[0].id, 2)
+        self.assertIsNotNone(result.record_path)
+
+
 def _cached_qwen() -> Path | None:
     from sememe.sources import scan_hub_cache
     return next((c.folder for c in scan_hub_cache() if c.label == "Qwen/Qwen3.5-0.8B" and c.loadable), None)
