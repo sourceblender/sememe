@@ -93,9 +93,9 @@ class RealLoadEventTests(unittest.TestCase):
         self.assertEqual([e.done for e in install], list(range(1, install[-1].total + 1)))
         self.assertTrue(install[-1].finished and install[-1].unit == "parameters")
         self.assertEqual([e.phase for e in events if e.finished],
-                         ["import", "config", "install", "inspect"])
+                         ["import", "config", "install", "tokenizer", "inspect"])
         starts = [e.phase for e in events if not e.finished and e.done is None]
-        self.assertEqual(starts, ["import", "config", "install", "inspect"])  # every phase opens before it works
+        self.assertEqual(starts, ["import", "config", "install", "tokenizer", "inspect"])  # every phase opens before it works
         self.assertIs(loading.tqdm, original)
         self.assertGreater(info.param_count, 0)
 
@@ -103,8 +103,76 @@ class RealLoadEventTests(unittest.TestCase):
         import transformers.core_model_loading as loading
         original = loading.tqdm
         engine = TorchEngine()
-        with patch("transformers.AutoModel.from_pretrained", side_effect=RuntimeError("disk vanished")):
+        class Vanishing:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                raise RuntimeError("disk vanished")
+
+        with patch("sememe.engine.torch_engine._task_class", return_value=Vanishing):
             with self.assertRaises(EngineError) as caught:
                 engine.load(_cached_qwen())
         self.assertIn("install failed: disk vanished", str(caught.exception))
         self.assertIs(loading.tqdm, original)
+
+
+@unittest.skipIf(torch is None or _cached_qwen() is None, "needs sememe[torch] and a cached Qwen/Qwen3.5-0.8B")
+class RealRunTests(unittest.TestCase):
+    """A run must equal a direct transformers call on the same tokens."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import tempfile
+        cls.runs = tempfile.TemporaryDirectory()
+        cls.env = patch.dict("os.environ", {"SEMEME_RUNS_DIR": cls.runs.name})
+        cls.env.start()
+        cls.engine = TorchEngine()
+        cls.engine.load(_cached_qwen())
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.env.stop()
+        cls.runs.cleanup()
+
+    def test_top_candidates_equal_a_direct_call_over_the_full_vocabulary(self) -> None:
+        import transformers
+        from sememe.engine.api import RunSettings
+        prompt = "The capital of France is"
+        result = self.engine.run(prompt, RunSettings(top_k=5))
+        cls = getattr(transformers, transformers.AutoConfig.from_pretrained(_cached_qwen()).architectures[0])
+        model = cls.from_pretrained(_cached_qwen(), dtype="auto").eval()
+        tokenizer = transformers.AutoTokenizer.from_pretrained(_cached_qwen())
+        ids = tokenizer(prompt, return_tensors="pt")
+        with torch.inference_mode():
+            probs = model(**ids).logits[0, -1].float().softmax(-1)
+        top_p, top_i = probs.topk(5)
+        self.assertEqual([t.id for t in result.tokens], ids["input_ids"][0].tolist())
+        self.assertEqual([c.id for c in result.candidates], top_i.tolist())
+        for c, p in zip(result.candidates, top_p.tolist()):
+            self.assertAlmostEqual(c.probability, p, places=6)
+        self.assertEqual(result.candidates[0].text, " Paris")
+        self.assertEqual(result.used["vocab_size"], probs.shape[-1])
+
+    def test_a_run_writes_one_bounded_record(self) -> None:
+        import json
+        from sememe.engine.api import RunSettings
+        result = self.engine.run("Hello world", RunSettings(top_k=3))
+        record = json.loads(Path(result.record_path).read_text())
+        self.assertEqual(record["schema"], "sememe.run/1")
+        self.assertEqual(record["run_id"], result.run_id)
+        self.assertEqual(len(record["candidates"]), 3)
+        self.assertEqual(record["model"]["class"], "Qwen3_5ForConditionalGeneration")
+        self.assertEqual(len(record["model"]["config_sha256"]), 64)
+        self.assertNotIn("logits", json.dumps(record))  # no tensors in a record
+
+    def test_whitespace_and_unicode_tokens_keep_their_exact_text(self) -> None:
+        from sememe.engine.api import RunSettings
+        result = self.engine.run("Café 東京\n", RunSettings(top_k=1))
+        self.assertEqual("".join(t.text for t in result.tokens), "Café 東京\n")
+
+    def test_an_engine_closed_after_loading_refuses_to_run(self) -> None:
+        from sememe.engine.api import RunSettings
+        engine = TorchEngine()
+        engine.load(_cached_qwen())
+        engine.close()
+        with self.assertRaises(EngineError):
+            engine.run("x", RunSettings())

@@ -7,14 +7,18 @@ run in mock mode without the optional model dependencies installed.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import hashlib
+import json
 import math
 import threading
 import time
 from pathlib import Path
-from typing import Callable
-from typing import Any
+from typing import Any, Callable
 
-from .api import EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, TensorInfo, TensorStats
+from .api import (Candidate, EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, RunResult, RunSettings,
+                  TensorInfo, TensorStats, Token)
+from ..records import new_run_id, write_record
 
 
 class TorchEngine:
@@ -25,6 +29,9 @@ class TorchEngine:
         self._modules: dict[str, Any] = {}
         self._info: ModelInfo | None = None
         self._torch: Any | None = None
+        self._full: Any | None = None  # the task model with its output head, when runnable
+        self._tokenizer: Any | None = None
+        self._identity: dict = {}
 
     def load(self, model: str | Path, progress: Progress | None = None,
              cancelled: Callable[[], bool] | None = None) -> ModelInfo:
@@ -52,6 +59,7 @@ class TorchEngine:
             emit(LoadEvent("import", "importing torch and transformers", clock()))
             try:
                 import torch
+                import transformers
                 from transformers import AutoConfig, AutoModel
             except ImportError as exc:
                 raise EngineError(
@@ -77,11 +85,34 @@ class TorchEngine:
             with _install_events(check, lambda done, total, name: emit(LoadEvent(
                     "install", "parameters installed", clock(), done=done, total=total,
                     unit="parameters", item=name, finished=done == total))) as seen:
-                loaded = AutoModel.from_pretrained(identifier, config=config, dtype="auto", trust_remote_code=False)
+                # The task model (with its output head) when transformers knows the
+                # architecture; otherwise the base model, which can be inspected
+                # but not run. Inspection always looks at the base model, so
+                # module addresses are the same either way.
+                full_cls = _task_class(transformers, config)
+                full = (full_cls or AutoModel).from_pretrained(identifier, config=config, dtype="auto",
+                                                               trust_remote_code=False)
             if not seen:
                 emit(LoadEvent("install", "weights installed (this transformers version reports no per-parameter "
                                "events)", clock(), finished=True))
-            loaded.eval()
+            full.eval()
+            loaded = _base_of(full)
+
+            phase = "tokenizer"
+            check()
+            emit(LoadEvent("tokenizer", "loading tokenizer", clock()))
+            tokenizer = None
+            tokenizer_note = "no tokenizer: this transformers build has no AutoTokenizer"
+            auto_tokenizer = getattr(transformers, "AutoTokenizer", None)
+            if full_cls is None:
+                tokenizer_note = "no output head for this architecture, so the model can be inspected but not run"
+            elif auto_tokenizer is not None:
+                try:
+                    tokenizer = auto_tokenizer.from_pretrained(identifier, trust_remote_code=False)
+                    tokenizer_note = f"tokenizer loaded: {type(tokenizer).__name__}"
+                except Exception as exc:  # a model without a tokenizer is still inspectable
+                    tokenizer_note = f"no tokenizer ({exc}); the model can be inspected but not run"
+            emit(LoadEvent("tokenizer", tokenizer_note, clock(), finished=True))
 
             phase = "inspect"
             emit(LoadEvent("inspect", "enumerating modules", clock()))
@@ -115,13 +146,81 @@ class TorchEngine:
         # Publish a complete snapshot only after loading and enumeration succeed.
         self._torch = torch
         self._model = loaded
+        self._full = full if full_cls is not None else None
+        self._tokenizer = tokenizer
+        self._identity = _identity(identifier, full, config, torch, transformers)
         self._modules = modules
         self._info = info
         return info
 
+    def run(self, prompt: str, settings: RunSettings,
+            cancelled: Callable[[], bool] | None = None) -> RunResult:
+        """One forward pass over `prompt`, scored at the final position.
+
+        The forward itself cannot be interrupted; `cancelled` is checked before
+        tokenizing, before the forward, and after it (a run cancelled after its
+        forward is reported as cancelled and not recorded)."""
+        stop = cancelled or (lambda: False)
+        # Local references: a Close or a new load may clear the engine's fields
+        # while this forward runs; the run keeps using the model it started with.
+        full, tokenizer, torch, identity = self._full, self._tokenizer, self._torch, dict(self._identity)
+        if full is None or tokenizer is None or torch is None:
+            raise EngineError("This model can be inspected but not run: it has no output head or no tokenizer.")
+        if not prompt:
+            raise EngineError("Type a prompt to run.")
+        if settings.top_k < 1:
+            raise EngineError("top_k must be at least 1.")
+        timing: dict[str, float] = {}
+        if stop():
+            raise EngineError("cancelled before tokenizing")
+        t0 = time.monotonic()
+        encoded = tokenizer(prompt, return_tensors="pt")
+        ids = encoded["input_ids"]
+        timing["tokenize"] = time.monotonic() - t0
+        if ids.shape[-1] == 0:
+            raise EngineError("The prompt tokenized to zero tokens.")
+        tokens = tuple(Token(int(i), tokenizer.decode([int(i)])) for i in ids[0])
+        device = next(full.parameters()).device
+        if stop():
+            raise EngineError("cancelled before the forward pass")
+        t0 = time.monotonic()
+        try:
+            with torch.inference_mode():
+                logits = full(**{k: v.to(device) for k, v in encoded.items()}).logits
+        except Exception as exc:
+            raise EngineError(f"forward failed: {exc}") from exc
+        timing["forward"] = time.monotonic() - t0
+        if stop():
+            raise EngineError("cancelled after the forward pass; the result was discarded")
+        t0 = time.monotonic()
+        last = logits[0, -1].float()
+        probs = torch.softmax(last, dim=-1)
+        k = min(settings.top_k, probs.shape[-1])
+        top_p, top_i = torch.topk(probs, k)
+        candidates = tuple(Candidate(int(i), tokenizer.decode([int(i)]), float(p), float(last[int(i)]))
+                           for p, i in zip(top_p, top_i))
+        timing["score"] = time.monotonic() - t0
+        used = {
+            "device": str(device),
+            "dtype": str(logits.dtype).removeprefix("torch."),
+            "scored_dtype": "float32",
+            "position": int(ids.shape[-1]) - 1,
+            "tokenizer": type(tokenizer).__name__,
+            "add_special_tokens": True,
+            "chat_template": False,
+            "vocab_size": int(probs.shape[-1]),
+            "top_k": k,
+        }
+        result = RunResult(run_id=new_run_id(), prompt=prompt, tokens=tokens, candidates=candidates,
+                           settings=settings, used=used, model=identity, timing=timing)
+        path = write_record(result)
+        return dataclasses.replace(result, record_path=str(path))
+
     def close(self) -> None:
         """Drop every reference to the model so its memory can be freed."""
         self._model = None
+        self._full = None
+        self._tokenizer = None
         self._modules = {}
         self._info = None
 
@@ -261,3 +360,35 @@ def _install_events(check, report):
             yield seen
         finally:
             loading.tqdm = original
+
+
+def _task_class(transformers, config):
+    """The class named by the config's architectures, if transformers has it and
+    it carries an output head. None means: inspect only."""
+    for name in getattr(config, "architectures", None) or ():
+        cls = getattr(transformers, name, None)
+        if cls is not None and "For" in name:
+            return cls
+    return None
+
+
+def _base_of(full):
+    """The base model inside a task model (`.model`), so inspected addresses match
+    what the base class alone reports. Falls back to the model itself."""
+    base = getattr(full, "model", None)
+    return base if base is not None and hasattr(base, "named_modules") else full
+
+
+def _identity(identifier, full, config, torch, transformers) -> dict:
+    """Enough to tell later whether a record or setup belongs to this model."""
+    try:
+        config_json = config.to_json_string(use_diff=False)
+    except Exception:
+        config_json = json.dumps(getattr(config, "__dict__", {}), default=str, sort_keys=True)
+    return {
+        "ref": identifier,
+        "class": type(full).__name__,
+        "config_sha256": hashlib.sha256(config_json.encode()).hexdigest(),
+        "torch": getattr(torch, "__version__", "?"),
+        "transformers": getattr(transformers, "__version__", "?"),
+    }

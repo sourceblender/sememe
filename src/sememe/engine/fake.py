@@ -15,7 +15,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from sememe.engine.api import EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, TensorInfo, TensorStats
+from sememe.engine.api import (Candidate, EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, RunResult,
+                               RunSettings, TensorInfo, TensorStats, Token)
 
 HIDDEN = 1024
 INTERMEDIATE = 3584
@@ -174,6 +175,28 @@ class FakeEngine:
         emit(LoadEvent("inspect", f"{len(info.modules)} modules enumerated — MOCK", clock(), finished=True))
         self._info = info
         return self._info
+
+    def run(self, prompt: str, settings: RunSettings,
+            cancelled: Callable[[], bool] | None = None) -> RunResult:
+        """A synthetic run: whitespace "tokens" and fixed candidates, all MOCK.
+        Never written as a record, because it measures nothing."""
+        if self._info is None:
+            raise EngineError("no model loaded")
+        if not prompt:
+            raise EngineError("Type a prompt to run.")
+        if cancelled is not None and cancelled():
+            raise EngineError("cancelled before the forward pass")
+        if self.step_delay:
+            time.sleep(self.step_delay * 50)
+        words = prompt.split(" ")
+        tokens = tuple(Token(1000 + i, (" " if i else "") + w) for i, w in enumerate(words))
+        pool = [(" Paris", 0.31), (" the", 0.12), (" a", 0.08), (":", 0.05), ("\n", 0.04),
+                (" located", 0.03), (" known", 0.02), (" one", 0.02), (",", 0.01), (" in", 0.01)]
+        k = max(1, min(settings.top_k, len(pool)))
+        candidates = tuple(Candidate(2000 + i, text, p, math.log(p)) for i, (text, p) in enumerate(pool[:k]))
+        return RunResult(run_id="mock", prompt=prompt, tokens=tokens, candidates=candidates, settings=settings,
+                         used={"engine": "MOCK", "top_k": k}, model={"class": "FakeEngine — MOCK"},
+                         timing={"forward": 0.0}, record_path=None)
 
     def close(self) -> None:
         self._info = None

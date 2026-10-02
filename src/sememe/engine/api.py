@@ -113,6 +113,51 @@ class LoadEvent:
 Progress = Callable[[LoadEvent], None]
 
 
+@dataclass(frozen=True)
+class RunSettings:
+    """What the caller asks for. The record keeps these plus what was actually used."""
+
+    top_k: int = 10
+
+
+@dataclass(frozen=True)
+class Token:
+    """One token as the tokenizer produced it: its id and its exact decoded text."""
+
+    id: int
+    text: str
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One next-token candidate at the final input position."""
+
+    id: int
+    text: str
+    probability: float  # softmax over the full vocabulary, computed in float32
+    logit: float
+
+
+@dataclass(frozen=True)
+class RunResult:
+    """One controlled forward pass: exact input, top next tokens, and how it ran.
+
+    No generation: a single forward over the prompt, scored at its last position.
+    `used` records the settings and runtime actually in effect (device, dtype,
+    tokenizer options), never the ones merely requested.
+    """
+
+    run_id: str
+    prompt: str
+    tokens: tuple[Token, ...]
+    candidates: tuple[Candidate, ...]
+    settings: RunSettings
+    used: dict[str, Any]
+    model: dict[str, Any]  # identity of the loaded model: class, ref, config digest, versions
+    timing: dict[str, float]  # seconds per stage
+    record_path: str | None = None
+
+
 class EngineError(RuntimeError):
     """The engine could not answer. The message is safe to show in the UI."""
 
@@ -137,4 +182,11 @@ class Engine(Protocol):
 
     def param_stats(self, module: str, tensor: str) -> TensorStats:
         """Statistics of one tensor, e.g. ("model.layers.3.mlp.up_proj", "weight")."""
+        ...
+
+    def run(self, prompt: str, settings: RunSettings,
+            cancelled: Callable[[], bool] | None = None) -> RunResult:
+        """One forward pass over `prompt`, scored at the last position. Never
+        generates. `cancelled` is checked at the run's boundaries only: a forward
+        already executing is not interrupted."""
         ...
