@@ -19,6 +19,7 @@ from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import (
+    Button,
     DataTable,
     Footer,
     Header,
@@ -32,6 +33,8 @@ from textual.widgets import (
 )
 
 from sememe.engine.api import Engine, EngineError, ModelInfo, ModuleInfo
+from sememe.sources import ModelChoice
+from sememe.ui.picker import LOAD_DISK, LOAD_HF, ActivityMenu, DiskPicker, HubPicker, MenuBar, describe
 
 # Component kinds, each with one colour across the whole UI.
 # Fixed colours, so every terminal and theme draws a kind the same way.
@@ -216,8 +219,15 @@ class Cockpit(App):
     #monitor { height: 6; border-top: solid $accent; }
     #monitor Vertical { width: 1fr; padding: 0 1; }
     #monitor Sparkline { height: 2; }
+    MenuBar { height: 1; background: $panel; }
+    MenuBar Button.menu { height: 1; min-width: 0; border: none; padding: 0 1; background: $panel; }
+    MenuBar Button.menu:hover { background: $accent; }
+    MenuBar Button.menu:disabled { color: $text-disabled; }
+    #menu-spacer { width: 1fr; }
+    #menu-selection { width: auto; padding: 0 1; }
     """
     BINDINGS = [
+        Binding("f10", "menu", "menu"),
         Binding("slash", "search", "search"),
         Binding("s", "stats", "weight stats"),
         Binding("q", "quit", "quit"),
@@ -231,10 +241,12 @@ class Cockpit(App):
         self.mock = mock
         self.info: ModelInfo | None = None
         self.selected: str | None = None
+        self.choice: ModelChoice | None = None  # picked in the menu, not loaded
         self.series = {name: deque([base] * 60, maxlen=60) for name, (_, base) in MONITOR.items()}
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield MenuBar(id="menubar")
         yield Input(placeholder="jump to module path…", id="search")
         with TabbedContent(id="tabs"):
             with TabPane("Architecture", id="tab-arch"):
@@ -255,6 +267,10 @@ class Cockpit(App):
     def on_mount(self) -> None:
         self.sub_title = f"loading {self.model_ref}…"
         self.load_model()
+        # Held, not queried per tick: a tick that lands while the app is shutting
+        # down would otherwise find no widgets and raise.
+        self.monitor_widgets = {name: (self.query_one(f"#mon-{name}", Sparkline),
+                                       self.query_one(f"#mon-{name}-label", Label)) for name in MONITOR}
         self.set_interval(0.5, self.tick_monitor)
         self.query_one("#decode", Static).update(Text.assemble(
             ("Decode — MOCK\n\n", "bold"), ("> The cat sat on the\n\n", ""),
@@ -381,14 +397,41 @@ class Cockpit(App):
         if path == self.selected:
             self.call_from_thread(self.query_one("#side-stats", Static).update, text)
 
+    def action_menu(self) -> None:
+        self.push_screen(ActivityMenu(), self.menu_chosen)
+
+    @on(Button.Pressed, "#menu-activity")
+    def activity_pressed(self) -> None:
+        self.action_menu()
+
+    def menu_chosen(self, item: str | None) -> None:
+        if item == LOAD_HF:
+            self.push_screen(HubPicker(), self.model_chosen)
+        elif item == LOAD_DISK:
+            self.push_screen(DiskPicker(), self.model_chosen)
+
+    def model_chosen(self, choice: ModelChoice | None) -> None:
+        """Record the pick. Cancel (None) keeps whatever was selected before."""
+        if choice is None:
+            return
+        self.choice = choice
+        self.query_one("#menu-selection", Static).update(describe(choice))
+        self.query_one("#menu-play", Button).disabled = False
+
+    @on(Button.Pressed, "#menu-play")
+    def play_pressed(self) -> None:
+        self.notify("Starting a model arrives in the next slice. Nothing is loaded; the cockpit still shows the mock.",
+                    title="Play", timeout=6)
+
     def tick_monitor(self) -> None:
         """Synthetic series until real timing lands; every label says MOCK."""
         for name, series in self.series.items():
             label, base = MONITOR[name]
             nxt = series[-1] + random.uniform(-0.04, 0.04) * base
             series.append(min(max(nxt, 0.8 * base), 1.2 * base))
-            self.query_one(f"#mon-{name}", Sparkline).data = list(series)
-            self.query_one(f"#mon-{name}-label", Label).update(f"{label}  {series[-1]:,.1f}  — MOCK")
+            spark, text = self.monitor_widgets[name]
+            spark.data = list(series)
+            text.update(f"{label}  {series[-1]:,.1f}  — MOCK")
 
 
 def main(argv: list[str] | None = None) -> None:
