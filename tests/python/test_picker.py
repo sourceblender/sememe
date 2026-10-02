@@ -516,3 +516,20 @@ async def test_a_superseded_load_stops_before_it_allocates(tmp_path, monkeypatch
         await pilot.pause(0.3)
         assert reached and reached[0].startswith("cancelled before config")
         assert engines[0]._info is None and app.engine is engines[1]
+
+
+@pytest.mark.asyncio
+async def test_the_title_art_renders_as_one_aligned_block(tmp_path, monkeypatch):
+    """Rendered on screen, every art row keeps its own column offset: the rows
+    move together or not at all. Centring rows of unequal width broke this."""
+    from sememe.ui.app import _TITLE_ROWS
+    app = await cockpit_with((100, 30), tmp_path, monkeypatch)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause(0.2)
+        off = app.query_one("#off")
+        lines = ["".join(seg.text for seg in strip) for strip in off.render_lines(off.region.reset_offset)]
+        rows = [line for line in lines if "█" in line]
+        assert len(rows) == len(_TITLE_ROWS)
+        indent = lambda text: len(text) - len(text.lstrip(" "))  # noqa: E731
+        shifts = {indent(drawn) - indent(source) for drawn, source in zip(rows, _TITLE_ROWS)}
+        assert len(shifts) == 1, f"rows shifted against each other by {sorted(shifts)}"
