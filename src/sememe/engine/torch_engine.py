@@ -260,4 +260,3 @@ def _install_events(check, report):
             yield seen
         finally:
             loading.tqdm = original
-
