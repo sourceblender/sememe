@@ -163,6 +163,35 @@ can't.
 **Gate.** `just gate`, with the bridge tests loading Qwen3.5-0.8B. Each fix is
 red-proofed: putting the old behaviour back fails a test.
 
+## Direction (agreed with Eric, 2026-10-02)
+
+The model map is the nerve center, not a picture. Everything else hangs off one thing:
+the selected node, an exact module or tensor address in the loaded model.
+
+- **The map shows state.** Colours mean component type today. Once there is measured
+  execution, a node can show it is active, and with record and replay you watch activity
+  move through the layers. A node that carries a watch, log or hook gets a marker, so you
+  can see at a glance where the model is instrumented.
+- **The sidebar is the selected node's control panel**, in fixed sections: Inspect (what
+  it is and its weights, built), then Watch, Log and Hook as each arrives. Every tool
+  targets the same selection, so you never have to find the path again.
+- **Setups are saved and reloaded**: selection, watches, hooks and display choices. A
+  saved setup records the model it was made for (repo and revision, or a config hash),
+  so reloading it onto a different model warns instead of attaching to the wrong place.
+- **Research operations, not research methods.** The feature list comes from the
+  operations that interpretability research needs, not from any one paper's method:
+  capture a state, select a layer, token or tensor region, measure, compare runs, attach
+  a probe, intervene, sweep many cases, and record the experiment. Each one gets an
+  overlay on the map, the sidebar and the views, with current support and gaps side by
+  side. A method such as the tuned lens is then built from those operations.
+- **Static before dynamic.** With a model loaded but idle, sememe shows structure and
+  weights. Those describe a component; they do not say it matters for an answer. That
+  takes a run with a measurement or an intervention, so the UI never presents a weight
+  statistic as importance.
+
+The M1–M2.1 sections above describe the Rust prototype. The Python cockpit does not
+use it; whether Rust keeps a role is an open decision with Eric.
+
 ## How we build from here
 
 PyTorch's hook surface is too large to design up front, so sememe grows from the app
