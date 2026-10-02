@@ -14,6 +14,16 @@ async def started(pilot, app):
     raise AssertionError("the model never loaded")
 
 
+@pytest.mark.asyncio
+async def test_quit_works_immediately_after_startup():
+    app = Cockpit(FakeEngine(), "fake", mock=True)
+    async with app.run_test(size=(160, 50)) as pilot:
+        await started(pilot, app)
+        await pilot.press("q")
+        await pilot.pause(0.1)
+        assert not app.is_running
+
+
 def test_the_block_map_reads_the_hybrid_layers_from_the_model():
     layers = decoder_layers(qwen_like_model_info())
     assert len(layers) == 24

@@ -189,6 +189,9 @@ class Sidebar(Vertical):
 
 
 class Cockpit(App):
+    # Search starts hidden; it should only take focus when explicitly opened.
+    AUTO_FOCUS = None
+
     CSS = """
     Screen { layout: vertical; }
     #main { height: 1fr; }
