@@ -189,7 +189,7 @@ the selected node, an exact module or tensor address in the loaded model.
   takes a run with a measurement or an intervention, so the UI never presents a weight
   statistic as importance.
 
-The M1–M2.1 sections below describe the Rust prototype. The Python cockpit does not
+The M1–M2.1 sections above describe the Rust prototype. The Python cockpit does not
 use it; whether Rust keeps a role is an open decision with Eric.
 
 ## How we build from here
