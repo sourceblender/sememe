@@ -34,7 +34,7 @@ from textual.widgets import (
 
 from sememe.engine.api import Engine, EngineError, ModelInfo, ModuleInfo
 from sememe.sources import ModelChoice
-from sememe.ui.picker import LOAD_DISK, LOAD_HF, ActivityMenu, DiskPicker, HubPicker, MenuBar, describe
+from sememe.ui.picker import LOAD_DISK, LOAD_HF, ModelMenu, DiskPicker, HubPicker, MenuBar, describe
 
 # Component kinds, each with one colour across the whole UI.
 # Fixed colours, so every terminal and theme draws a kind the same way.
@@ -398,10 +398,10 @@ class Cockpit(App):
             self.call_from_thread(self.query_one("#side-stats", Static).update, text)
 
     def action_menu(self) -> None:
-        self.push_screen(ActivityMenu(), self.menu_chosen)
+        self.push_screen(ModelMenu(), self.menu_chosen)
 
-    @on(Button.Pressed, "#menu-activity")
-    def activity_pressed(self) -> None:
+    @on(Button.Pressed, "#menu-model")
+    def model_pressed(self) -> None:
         self.action_menu()
 
     def menu_chosen(self, item: str | None) -> None:

@@ -1,4 +1,4 @@
-"""The Activity menu and both model pickers, on a fake cache: no torch, no hub."""
+"""The Model menu and both model pickers, on a fake cache: no torch, no hub."""
 
 from pathlib import Path
 
@@ -8,7 +8,7 @@ from textual.widgets import Button, DataTable, Static
 from sememe.engine.fake import FakeEngine
 from sememe.sources import choice_for_path, hub_cache_dir, scan_hub_cache
 from sememe.ui.app import Cockpit
-from sememe.ui.picker import ActivityMenu, DiskPicker, HubPicker
+from sememe.ui.picker import ModelMenu, DiskPicker, HubPicker
 
 
 def model_folder(folder: Path, config: bool = True, weights: bool = True) -> Path:
@@ -73,21 +73,21 @@ async def test_f10_opens_the_menu_and_escape_gives_focus_back(tmp_path, monkeypa
         before = app.focused
         await pilot.press("f10")
         await pilot.pause(0.1)
-        assert isinstance(app.screen, ActivityMenu)
+        assert isinstance(app.screen, ModelMenu)
         await pilot.press("escape")
         await pilot.pause(0.1)
-        assert not isinstance(app.screen, ActivityMenu)
+        assert not isinstance(app.screen, ModelMenu)
         assert app.focused is before
 
 
 @pytest.mark.asyncio
-async def test_clicking_activity_opens_the_menu(tmp_path, monkeypatch):
+async def test_clicking_model_opens_the_menu(tmp_path, monkeypatch):
     app = await cockpit_with((160, 50), tmp_path, monkeypatch)
     async with app.run_test(size=(160, 50)) as pilot:
         await pilot.pause(0.3)
-        await pilot.click("#menu-activity")
+        await pilot.click("#menu-model")
         await pilot.pause(0.1)
-        assert isinstance(app.screen, ActivityMenu)
+        assert isinstance(app.screen, ModelMenu)
 
 
 @pytest.mark.asyncio

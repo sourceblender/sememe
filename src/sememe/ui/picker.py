@@ -34,29 +34,29 @@ def describe(choice: ModelChoice | None) -> Text:
 
 
 class MenuBar(Horizontal):
-    """One row under the title: the Activity menu on the left, the selected
+    """One row under the title: the Model menu on the left, the selected
     model and its Play / Stop controls on the right."""
 
     def compose(self) -> ComposeResult:
-        yield Button("Activity ▾", id="menu-activity", classes="menu")
+        yield Button("Model ▾", id="menu-model", classes="menu")
         yield Static("", id="menu-spacer")
         yield Static(describe(None), id="menu-selection")
         yield Button("▶ Play", id="menu-play", classes="menu", disabled=True)
         yield Button("■ Stop", id="menu-stop", classes="menu", disabled=True)
 
 
-class ActivityMenu(ModalScreen[str | None]):
-    """The dropdown under `Activity ▾`."""
+class ModelMenu(ModalScreen[str | None]):
+    """The dropdown under `Model ▾`."""
 
     BINDINGS = [Binding("escape", "dismiss(None)", "close")]
     DEFAULT_CSS = """
-    ActivityMenu { align: left top; background: transparent; }
-    ActivityMenu OptionList { width: 32; height: auto; margin: 2 0 0 0; border: round $accent; }
+    ModelMenu { align: left top; background: transparent; }
+    ModelMenu OptionList { width: 32; height: auto; margin: 2 0 0 0; border: round $accent; }
     """
 
     def compose(self) -> ComposeResult:
         yield OptionList(Option("Load Hugging Face Model…", id=LOAD_HF),
-                         Option("Load Model from Disk…", id=LOAD_DISK), id="activity-options")
+                         Option("Load Model from Disk…", id=LOAD_DISK), id="model-options")
 
     def on_mount(self) -> None:
         # Opened by keyboard, Enter must act on something: start on the first entry.
