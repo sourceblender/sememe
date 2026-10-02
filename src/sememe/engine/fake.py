@@ -15,7 +15,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from sememe.engine.api import (Candidate, EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, RunResult,
+from sememe.engine.api import (Candidate, EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, RunFailed,
+                               RunResult,
                                RunSettings, TensorInfo, TensorStats, Token)
 
 HIDDEN = 1024
@@ -180,14 +181,18 @@ class FakeEngine:
             cancelled: Callable[[], bool] | None = None) -> RunResult:
         """A synthetic run: whitespace "tokens" and fixed candidates, all MOCK.
         Never written as a record, because it measures nothing."""
+        not_saved = "MOCK runs are not recorded"
         if self._info is None:
-            raise EngineError("no model loaded")
+            raise RunFailed("no model loaded", "mock", "rejected", None, not_saved)
         if not prompt:
-            raise EngineError("Type a prompt to run.")
+            raise RunFailed("Type a prompt to run.", "mock", "rejected", None, not_saved)
         if cancelled is not None and cancelled():
-            raise EngineError("cancelled before the forward pass")
+            raise RunFailed("cancelled before the forward pass", "mock", "cancelled", None, not_saved)
         if self.step_delay:
             time.sleep(self.step_delay * 50)
+        if cancelled is not None and cancelled():
+            raise RunFailed("cancelled after the forward pass; the result was discarded", "mock", "cancelled", None,
+                            not_saved)
         words = prompt.split(" ")
         tokens = tuple(Token(1000 + i, (" " if i else "") + w) for i, w in enumerate(words))
         pool = [(" Paris", 0.31), (" the", 0.12), (" a", 0.08), (":", 0.05), ("\n", 0.04),

@@ -8,6 +8,7 @@ a model loads. Panels whose data is not real yet say MOCK in their title.
 from __future__ import annotations
 
 import argparse
+import json
 from typing import Callable
 import random
 from collections import deque
@@ -36,7 +37,8 @@ from textual.widgets import (
     Tree,
 )
 
-from sememe.engine.api import Engine, EngineError, LoadEvent, ModelInfo, ModuleInfo, TensorInfo
+from sememe.engine.api import (Engine, EngineError, LoadEvent, ModelInfo, ModuleInfo, RunFailed, RunResult,
+                               RunSettings, TensorInfo)
 from sememe.sources import ModelChoice, label_for
 from sememe.ui.picker import CLOSE_MODEL, LOAD_DISK, LOAD_HF, ModelMenu, DiskPicker, HubPicker, MenuBar, describe
 
@@ -259,6 +261,13 @@ class Cockpit(App):
     #side-params { height: auto; max-height: 8; }
     #side-stats { height: auto; margin: 1 0; }
     #side-tree { height: 12; }
+    #run-panel { height: 1fr; padding: 0 1; }
+    #run-bar { height: 3; }
+    #run-prompt { width: 1fr; }
+    #run-status { height: auto; margin-top: 1; }
+    #run-tokens { height: auto; margin-top: 1; }
+    #run-candidates { height: auto; margin-top: 1; }
+    #run-meta { height: auto; margin-top: 1; }
     #search { display: none; dock: top; }
     #search.open { display: block; }
     #monitor { height: 6; border-top: solid $accent; }
@@ -305,6 +314,8 @@ class Cockpit(App):
         self.choice: ModelChoice | None = None  # what the Model menu picked
         self.state = "off"  # off | loading | loaded | failed
         self.load_token = 0  # bumped by every load and close; stale results are dropped
+        self.run_token = 0  # bumped by every run; a superseded run's result is dropped
+        self.run_cancel = False  # Stop requested for the current run
         self.last_event: LoadEvent | None = None
         self.series = {name: deque([base] * 60, maxlen=60) for name, (_, base) in MONITOR.items()}
 
@@ -328,8 +339,15 @@ class Cockpit(App):
                         yield Tree("model", id="model-tree")
                     with TabPane("Tables", id="tab-tables"):
                         yield DataTable(id="all-params", cursor_type="row", zebra_stripes=True)
-                    with TabPane("Decode — MOCK", id="tab-decode"):
-                        yield Static(id="decode")
+                    with TabPane("Run", id="tab-run"):
+                        with VerticalScroll(id="run-panel"):
+                            with Horizontal(id="run-bar"):
+                                yield Input(placeholder="type a prompt, Enter to run it", id="run-prompt")
+                                yield Button("▶ Run", id="run-go", disabled=True)
+                            yield Static("", id="run-status")
+                            yield Static("", id="run-tokens")
+                            yield DataTable(id="run-candidates", cursor_type="row", zebra_stripes=True)
+                            yield Static("", id="run-meta")
                 yield Sidebar(id="sidebar")
         with Horizontal(id="monitor"):
             for name, (label, _) in MONITOR.items():
@@ -353,10 +371,7 @@ class Cockpit(App):
         self.w_bar = self.query_one("#load-bar", ProgressBar)
         self.w_basis = self.query_one("#load-basis", Static)
         self.w_log = self.query_one("#load-log", RichLog)
-        self.query_one("#decode", Static).update(Text.assemble(
-            ("Decode — MOCK\n\n", "bold"), ("> The cat sat on the\n\n", ""),
-            ("next token   mat 0.61 · floor 0.12 · couch 0.07\n", "green"),
-            ("\nA real prompt run arrives in a later slice.", "dim")))
+        self.reset_run_panel()
         self.show_state("off")
         if self.startup_model:
             self.start_load(self.startup_model, label_for(self.startup_model), engine=self.startup_engine)
@@ -365,10 +380,13 @@ class Cockpit(App):
 
     def show_state(self, state: str) -> None:
         self.state = state
-        self.query_one("#stage", ContentSwitcher).current = {"off": "off", "loaded": "cockpit"}.get(state, "loading")
+        self.query_one("#stage", ContentSwitcher).current = {"off": "off", "loaded": "cockpit",
+                                                             "running": "cockpit"}.get(state, "loading")
         self.query_one("#monitor").display = state == "loaded" and self.mock
         self.query_one("#menu-selection", Static).update(describe(self.model_ref, state))
         self.query_one("#menu-play", Button).disabled = state != "loaded"
+        self.query_one("#run-go", Button).disabled = state != "loaded"
+        self.query_one("#menu-stop", Button).disabled = state != "running" or self.run_cancel
         if state == "off":
             self.sub_title = ""
 
@@ -498,6 +516,7 @@ class Cockpit(App):
         self.query_one("#model-tree", Tree).clear()
         self.query_one("#model-summary", Static).update("")
         self.query_one("#all-params", DataTable).clear(columns=True)
+        self.reset_run_panel()
 
     def reset_sidebar(self) -> None:
         self.inspection_token += 1
@@ -706,10 +725,118 @@ class Cockpit(App):
         rev = f" @ {choice.revision[:7]}" if choice.revision else ""
         self.start_load(str(choice.folder), f"{choice.label}{rev}")
 
+    # ---- runs ----------------------------------------------------------------
+
+    def reset_run_panel(self) -> None:
+        self.query_one("#run-status", Static).update(Text(
+            "One forward pass over the prompt, scored at its last token. No generation.", style="dim"))
+        self.query_one("#run-tokens", Static).update("")
+        self.query_one("#run-candidates", DataTable).clear(columns=True)
+        self.query_one("#run-meta", Static).update("")
+
     @on(Button.Pressed, "#menu-play")
+    @on(Button.Pressed, "#run-go")
+    @on(Input.Submitted, "#run-prompt")
     def play_pressed(self) -> None:
-        self.notify("Running a prompt through the model arrives in the next slice. The weights are loaded and idle.",
-                    title="Play", timeout=6)
+        self.start_run()
+
+    def start_run(self) -> None:
+        if self.state != "loaded" or self.engine is None:
+            return
+        prompt = self.query_one("#run-prompt", Input).value
+        self.query_one("#tabs", TabbedContent).active = "tab-run"
+        if not prompt:
+            self.query_one("#run-prompt", Input).focus()
+            self.notify("Type a prompt in the Run tab, then press Enter or Play.")
+            return
+        self.run_token += 1
+        self.run_cancel = False
+        self.reset_run_panel()  # nothing from the previous run is shown as if it belonged to this one
+        self.query_one("#run-status", Static).update(Text("running one forward pass…", style="yellow"))
+        self.show_state("running")
+        self.run_model(self.engine, prompt, RunSettings(), self.load_token, self.run_token)
+
+    @work(thread=True, group="run")
+    def run_model(self, engine: Engine, prompt: str, settings: RunSettings, load_token: int, run_token: int) -> None:
+        stale = lambda: self.run_cancel or run_token != self.run_token or load_token != self.load_token  # noqa: E731
+        try:
+            result = engine.run(prompt, settings, cancelled=stale)
+        except RunFailed as exc:  # the attempt has an id and, usually, a record
+            where = (f"record: {exc.record_path}" if exc.record_path else exc.record_error or "record not saved")
+            self.call_from_thread(self.run_failed, load_token, run_token, f"{exc} ({exc.status}, run {exc.run_id}; "
+                                  f"{where})", exc.status == "cancelled")
+            return
+        except Exception as exc:  # shown, never swallowed
+            self.call_from_thread(self.run_failed, load_token, run_token, str(exc), False)
+            return
+        self.call_from_thread(self.run_finished, load_token, run_token, result)
+
+    @on(Button.Pressed, "#menu-stop")
+    def stop_pressed(self) -> None:
+        if self.state != "running":
+            return
+        self.run_cancel = True
+        self.query_one("#menu-stop", Button).disabled = True
+        self.query_one("#run-status", Static).update(Text(
+            "Stop requested. A forward pass already in progress can't be interrupted; "
+            "it finishes and its result is discarded.", style="yellow"))
+
+    def run_failed(self, load_token: int, run_token: int, message: str, cancelled: bool) -> None:
+        if load_token != self.load_token or run_token != self.run_token:
+            return
+        stopped = cancelled
+        self.query_one("#run-status", Static).update(
+            Text(f"Stopped: {message}", style="yellow") if stopped else Text(f"Run failed: {message}", style="bold red"))
+        self.show_state("loaded")
+
+    def run_finished(self, load_token: int, run_token: int, result: RunResult) -> None:
+        if load_token != self.load_token or run_token != self.run_token:
+            return  # a run superseded by a newer run, a new model or Close
+        if self.run_cancel:
+            # Stop was requested after the forward finished but before its result
+            # was shown: honour the Stop rather than present a result the user
+            # asked to discard.
+            self.query_one("#run-status", Static).update(Text(
+                "Stopped: the forward pass had already finished; its result was discarded.", style="yellow"))
+            self.show_state("loaded")
+            return
+        mock = result.record_path is None and self.mock
+        # The result names the exact prompt it belongs to: the input box stays
+        # editable, so its current text can differ from what produced this.
+        shown = json.dumps(result.prompt, ensure_ascii=False)
+        if len(shown) > 240:
+            shown = f"{shown[:240]}… ({len(result.prompt):,} characters; the record holds it exactly)"
+        self.query_one("#run-status", Static).update(Text.assemble(
+            ("next-token candidates", "bold"), ("  ·  MOCK" if mock else "", "yellow"),
+            (f"\nrun {result.run_id} · prompt ", "dim"), shown))
+        tokens = Text()
+        for token in result.tokens:
+            tokens.append(f"[{token.id}]", style="dim")
+            tokens.append(json.dumps(token.text, ensure_ascii=False) + "  ")
+        self.query_one("#run-tokens", Static).update(Text.assemble(
+            (f"{len(result.tokens)} input tokens (exact tokenizer output)\n", "dim"), tokens))
+        table = self.query_one("#run-candidates", DataTable)
+        table.clear(columns=True)
+        table.add_columns("rank", "token", "id", "probability", "logit")
+        for rank, c in enumerate(result.candidates, 1):
+            table.add_row(str(rank), json.dumps(c.text, ensure_ascii=False), str(c.id), f"{c.probability:.4%}",
+                          f"{c.logit:.3f}")
+        used = result.used
+        lines = []
+        if mock:
+            lines.append("MOCK engine: synthetic tokens and candidates; this run measures nothing and is not recorded.")
+        else:
+            lines.append(f"Softmax over the full vocabulary ({used.get('vocab_size', 0):,} tokens) at position "
+                         f"{used.get('position')}, computed in {used.get('scored_dtype')}; probabilities are not "
+                         "renormalised over the top candidates.")
+            lines.append(f"Ran on {used.get('device')} in {used.get('dtype')} · tokenizer {used.get('tokenizer')} · "
+                         f"special tokens {'added' if used.get('add_special_tokens') else 'not added'} · "
+                         f"chat template {'applied' if used.get('chat_template') else 'not applied'}")
+            lines.append("timing: " + "  ".join(f"{k} {v:.3f}s" for k, v in result.timing.items()))
+            lines.append(f"record: {result.record_path}" if result.record_path
+                         else f"NOT SAVED: {result.record_error}")
+        self.query_one("#run-meta", Static).update(Text("\n".join(lines), style="dim"))
+        self.show_state("loaded")
 
     def tick_monitor(self) -> None:
         """Synthetic series until real timing lands; every label says MOCK."""

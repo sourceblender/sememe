@@ -162,7 +162,8 @@ class RealRunTests(unittest.TestCase):
         self.assertEqual(len(record["candidates"]), 3)
         self.assertEqual(record["model"]["class"], "Qwen3_5ForConditionalGeneration")
         self.assertEqual(len(record["model"]["config_sha256"]), 64)
-        self.assertNotIn("logits", json.dumps(record))  # no tensors in a record
+        self.assertNotIn("logits", record)  # no tensors in a record
+        self.assertLess(len(json.dumps(record)), 8_000)  # bounded: tokens, top-k and metadata only
 
     def test_whitespace_and_unicode_tokens_keep_their_exact_text(self) -> None:
         from sememe.engine.api import RunSettings
@@ -170,9 +171,95 @@ class RealRunTests(unittest.TestCase):
         self.assertEqual("".join(t.text for t in result.tokens), "Café 東京\n")
 
     def test_an_engine_closed_after_loading_refuses_to_run(self) -> None:
-        from sememe.engine.api import RunSettings
+        from sememe.engine.api import RunFailed, RunSettings
         engine = TorchEngine()
         engine.load(_cached_qwen())
         engine.close()
-        with self.assertRaises(EngineError):
+        with self.assertRaises(RunFailed) as caught:
             engine.run("x", RunSettings())
+        self.assertEqual(caught.exception.status, "rejected")
+
+    def test_only_the_last_position_is_computed_and_no_cache_is_kept(self) -> None:
+        from sememe.engine.api import RunSettings
+        used = self.engine.run("one two three four five six", RunSettings(top_k=1)).used
+        self.assertEqual((used["use_cache"], used["logits_to_keep"], used["logits_positions"]), (False, 1, 1))
+
+    def test_over_budget_prompts_and_bad_top_k_are_rejected_and_recorded_without_a_forward(self) -> None:
+        import json
+        from sememe.engine.api import RunFailed, RunSettings
+        with self.assertRaises(RunFailed) as caught:
+            self.engine.run("The capital of France is", RunSettings(top_k=3, max_input_tokens=2))
+        failure = caught.exception
+        self.assertEqual(failure.status, "rejected")
+        self.assertIn("limit for one run is 2", str(failure))
+        record = json.loads(Path(failure.record_path).read_text())
+        self.assertEqual((record["status"], record["phase"]), ("rejected", "input"))
+        self.assertNotIn("forward", record["timing"])
+        self.assertEqual(len(record["tokens"]), 5)
+        with self.assertRaises(RunFailed) as caught:
+            self.engine.run("x", RunSettings(top_k=0))
+        self.assertIn("between 1 and 100", str(caught.exception))
+
+    def test_rejections_are_bounded_and_never_pretend_to_keep_the_exact_input(self) -> None:
+        import json
+        from sememe.engine.api import MAX_INPUT_TOKENS_CEILING, MAX_PROMPT_CHARS, RunFailed, RunSettings
+        with self.assertRaises(RunFailed) as caught:
+            self.engine.run("x", RunSettings(max_input_tokens=MAX_INPUT_TOKENS_CEILING + 1))
+        self.assertIn("max_input_tokens must be between", str(caught.exception))
+        huge = "word " * (MAX_PROMPT_CHARS // 5 + 10)
+        with self.assertRaises(RunFailed) as caught:
+            self.engine.run(huge, RunSettings())
+        record = json.loads(Path(caught.exception.record_path).read_text())
+        self.assertNotIn("tokenize", record["timing"])  # rejected before tokenizing
+        self.assertTrue(record["prompt_truncated"])
+        self.assertEqual(record["prompt_chars"], len(huge))
+        self.assertLessEqual(len(record["prompt"]), 2_000)
+        self.assertEqual(len(record["prompt_sha256"]), 64)
+        long = "token " * 3_000  # under the character guard, over a small token budget
+        with self.assertRaises(RunFailed) as caught:
+            self.engine.run(long, RunSettings(max_input_tokens=100))
+        record = json.loads(Path(caught.exception.record_path).read_text())
+        self.assertTrue(record["tokens_truncated"])
+        self.assertLessEqual(len(record["tokens"]), 256)
+        self.assertGreater(record["token_count"], 100)
+        self.assertLess(len(json.dumps(record)), 64_000)
+
+    def test_a_cancelled_attempt_is_recorded_as_cancelled(self) -> None:
+        import json
+        from sememe.engine.api import RunFailed, RunSettings
+        calls = []
+
+        def cancelled() -> bool:
+            calls.append(1)
+            return len(calls) >= 2  # let tokenizing start, stop before the forward
+
+        with self.assertRaises(RunFailed) as caught:
+            self.engine.run("Hello", RunSettings(), cancelled=cancelled)
+        record = json.loads(Path(caught.exception.record_path).read_text())
+        self.assertEqual((record["status"], record["phase"]), ("cancelled", "forward"))
+
+    def test_a_record_that_cannot_be_written_is_not_reported_as_saved(self) -> None:
+        import tempfile
+        from sememe.engine.api import RunSettings
+        with tempfile.NamedTemporaryFile() as blocker, patch.dict("os.environ", {"SEMEME_RUNS_DIR": blocker.name}):
+            result = self.engine.run("Hello", RunSettings(top_k=1))
+        self.assertIsNone(result.record_path)
+        self.assertIn("record not saved", result.record_error)
+
+    def test_identity_names_the_snapshot_revision_and_scopes_the_config_hash(self) -> None:
+        from sememe.engine.api import RunSettings
+        model = self.engine.run("Hello", RunSettings(top_k=1)).model
+        self.assertEqual(model["hub_repo"], "Qwen/Qwen3.5-0.8B")
+        self.assertEqual(model["revision"], Path(_cached_qwen()).name)
+        self.assertIn("does not identify weights", model["config_sha256_scope"])
+
+
+class TaskClassTests(unittest.TestCase):
+    def test_only_next_token_heads_can_run(self) -> None:
+        from sememe.engine.torch_engine import _task_class
+        fake = types.SimpleNamespace(BertForSequenceClassification=object, BertForMaskedLM=object,
+                                     LlamaForCausalLM=object)
+        pick = lambda *arch: _task_class(fake, types.SimpleNamespace(architectures=list(arch)))  # noqa: E731
+        self.assertIsNone(pick("BertForSequenceClassification"))
+        self.assertIsNone(pick("BertForMaskedLM"))
+        self.assertIs(pick("LlamaForCausalLM"), object)

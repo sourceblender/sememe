@@ -27,7 +27,7 @@ CLOSE_MODEL = "close-model"
 
 
 STATE_STYLE = {"loading": ("loading…", "yellow"), "loaded": ("loaded · stopped", "green"),
-               "failed": ("load failed", "red")}
+               "running": ("loaded · running", "yellow"), "failed": ("load failed", "red")}
 
 
 def describe(label: str | None, state: str = "off") -> Text:

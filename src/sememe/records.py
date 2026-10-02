@@ -29,15 +29,20 @@ def new_run_id() -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3)
 
 
-def write_record(result: Any) -> Path:
-    """Write `result` (a RunResult) as record.json under its run id; return the path."""
-    folder = runs_dir() / result.run_id
-    folder.mkdir(parents=True, exist_ok=False)
-    payload = dataclasses.asdict(result)
+def write_record(result: Any, status: str = "ok", **extra: Any) -> Path:
+    """Write a run (a RunResult, or a dict for an attempt that produced none) as
+    record.json under its run id, and return the path. Raises OSError if it
+    could not be written; callers must not then report the run as saved."""
+    payload = dataclasses.asdict(result) if dataclasses.is_dataclass(result) else dict(result)
     payload.pop("record_path", None)
+    payload.pop("record_error", None)
+    payload.update(extra)
     payload["schema"] = "sememe.run/1"
+    payload["status"] = status
+    folder = runs_dir() / payload["run_id"]
+    folder.mkdir(parents=True, exist_ok=False)
     path = folder / "record.json"
     tmp = folder / "record.json.tmp"
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
     tmp.replace(path)  # never a half-written record under the final name
     return path

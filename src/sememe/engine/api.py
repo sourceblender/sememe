@@ -115,9 +115,21 @@ Progress = Callable[[LoadEvent], None]
 
 @dataclass(frozen=True)
 class RunSettings:
-    """What the caller asks for. The record keeps these plus what was actually used."""
+    """What the caller asks for. The record keeps these plus what was actually used.
+
+    Bounds are checked before any forward pass and rejected visibly, never
+    silently truncated: 1 <= top_k <= MAX_TOP_K, input tokens <= max_input_tokens
+    <= MAX_INPUT_TOKENS_CEILING, and the raw prompt <= MAX_PROMPT_CHARS characters
+    (checked before tokenizing).
+    """
 
     top_k: int = 10
+    max_input_tokens: int = 4096
+
+
+MAX_TOP_K = 100
+MAX_INPUT_TOKENS_CEILING = 32_768  # max_input_tokens may not be set above this
+MAX_PROMPT_CHARS = 262_144  # raw text guard, checked before tokenizing
 
 
 @dataclass(frozen=True)
@@ -155,7 +167,21 @@ class RunResult:
     used: dict[str, Any]
     model: dict[str, Any]  # identity of the loaded model: class, ref, config digest, versions
     timing: dict[str, float]  # seconds per stage
-    record_path: str | None = None
+    record_path: str | None = None  # None when nothing was saved; see record_error
+    record_error: str | None = None  # why saving the record failed, if it did
+
+
+class RunFailed(Exception):
+    """A run attempt that did not produce a result: failed, cancelled or rejected.
+    Carries the attempt's id and where its record was written (if it was)."""
+
+    def __init__(self, message: str, run_id: str, status: str, record_path: str | None,
+                 record_error: str | None = None) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+        self.status = status  # "failed" | "cancelled" | "rejected"
+        self.record_path = record_path
+        self.record_error = record_error
 
 
 class EngineError(RuntimeError):
