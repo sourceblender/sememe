@@ -11,16 +11,16 @@ and will change as M1 is built out; see the [changelog](./CHANGELOG.md).
 
 ## Status
 
-M1 is in. The workspace builds, the library exposes the core types, the
-`Backend` seam, and a `Telemetry` live hub with subscriber callbacks. Tests
-exercise the surface end to end through a stub `Backend`. There is **no
-PyTorch bridge yet** — sememe has no connection to a running model, so
-nothing is observed from a real network until M2.
+M2 is in. The workspace builds, the library exposes the core types, the
+`Backend` seam, a `Telemetry` live hub with subscriber callbacks, and a
+PyO3 bridge (`crates/sememe-bridge`) that loads a real PyTorch model via
+`transformers.AutoModel` and walks `named_modules`. Hooks stream into
+the hub in M3; the TUI renders the live hub in M4.
 
 ## Build
 
 ```sh
-# full gate: format check, clippy, tests
+# full gate: format check, clippy, tests, Python wheel build + smoke
 just gate
 
 # or just build the workspace
@@ -34,18 +34,33 @@ cargo run -p sememe-cli
 # → sememe 0.0.0
 ```
 
+## Python setup (M2+)
+
+The bridge needs a venv with `torch`, `transformers`, `pyo3`-compatible
+Python, and `maturin`. `.venv/` is gitignored.
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+.venv/bin/pip install transformers pyarrow maturin
+just python-build   # builds the wheel into the venv
+```
+
 ## What is implemented
 
 - `crates/sememe` — the library crate, with `sememe::version()`, the
   observable types (`ModulePath`, `TensorView`, `EditOp`, …), the
   `Backend` trait, an in-memory `Telemetry` hub with subscriber
   callbacks, and a generic `Harness<B>` that wires the two together.
-  See [the roadmap](./docs/roadmap.md) for M1's full surface.
+- `crates/sememe-bridge` — PyO3 bridge that loads a real PyTorch
+  model via `transformers.AutoModel` and implements `Backend::
+  named_modules`. `run_forward` and `edit` are stubbed until M3 and
+  M5.
 - `apps/sememe-cli` — the `sememe` binary, which prints the version.
 
 ## What is not (yet)
 
-- A PyTorch bridge to attach to an actual model.
-- Hooks that stream observations from a live forward pass.
-- A TUI that renders the hub live.
-- Commands in the CLI beyond printing the version.
+- Hooks that stream observations from a live forward pass (M3).
+- A TUI that renders the hub live (M4).
+- Edit commands in the CLI (M5).
+- Replay of recorded sessions (M6).

@@ -3,6 +3,14 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# Python (M2+)
+/.venv/
+**/__pycache__/
+*.pyc
+*.so
+*.pyd
+.maturin/
+
 # Editor / OS
 .DS_Store
 .idea/
