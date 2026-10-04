@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from sememe.engine.api import (Candidate, EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, RunFailed,
+from sememe.engine.api import (Candidate, EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, RunFailed, WatchSpec, WatchBudget,
                                RunResult,
                                RunSettings, TensorInfo, TensorStats, Token)
 
@@ -178,9 +178,12 @@ class FakeEngine:
         return self._info
 
     def run(self, prompt: str, settings: RunSettings,
-            cancelled: Callable[[], bool] | None = None) -> RunResult:
+            cancelled: Callable[[], bool] | None = None, *,
+            watches: tuple[WatchSpec, ...] = (), watch_budget: WatchBudget = WatchBudget()) -> RunResult:
         """A synthetic run: whitespace "tokens" and fixed candidates, all MOCK.
         Never written as a record, because it measures nothing."""
+        if watches:
+            raise RunFailed("MOCK has no real activations to observe", "mock", "rejected", None)
         not_saved = "MOCK runs are not recorded"
         if self._info is None:
             raise RunFailed("no model loaded", "mock", "rejected", None, not_saved)

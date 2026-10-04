@@ -2,7 +2,8 @@
 
 A record holds what a run was and what it produced: the exact tokens, the top
 candidates, the settings requested and actually used, the model's identity and
-the timings. It holds no tensors; captures with explicit budgets come later.
+the timings. Observe-only captures contain bounded per-token summaries and
+explicit truncation/unsupported statuses, never raw activation tensors.
 """
 
 from __future__ import annotations
