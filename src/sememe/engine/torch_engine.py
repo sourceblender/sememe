@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .api import (MAX_INPUT_TOKENS_CEILING, MAX_PROMPT_CHARS, MAX_TOP_K, Candidate, EngineError, LoadEvent, ModelInfo, ModuleInfo, Progress, RunFailed,
-                  RunResult, RunSettings, TensorInfo, TensorStats, Token)
+                  RunResult, RunSettings, TensorInfo, TensorStats, Token, WatchSpec, WatchBudget)
 from ..records import new_run_id, write_record
 
 
@@ -32,6 +32,7 @@ class TorchEngine:
         self._full: Any | None = None  # the task model with its output head, when runnable
         self._tokenizer: Any | None = None
         self._identity: dict = {}
+        self._run_lock = threading.Lock()
 
     def load(self, model: str | Path, progress: Progress | None = None,
              cancelled: Callable[[], bool] | None = None) -> ModelInfo:
@@ -154,7 +155,8 @@ class TorchEngine:
         return info
 
     def run(self, prompt: str, settings: RunSettings,
-            cancelled: Callable[[], bool] | None = None) -> RunResult:
+            cancelled: Callable[[], bool] | None = None, *,
+            watches: tuple[WatchSpec, ...] = (), watch_budget: WatchBudget = WatchBudget()) -> RunResult:
         """One forward pass over `prompt`, scored at the final position.
 
         Every attempt gets a run id at its start and a record, whatever its
@@ -167,8 +169,15 @@ class TorchEngine:
         # Local references: a Close or a new load may clear the engine's fields
         # while this forward runs; the run keeps using the model it started with.
         full, tokenizer, torch, identity = self._full, self._tokenizer, self._torch, dict(self._identity)
+        from .watch import WatchSession
+        captures: list[dict[str, Any]] = []
         timing: dict[str, float] = {}
         attempt = {"run_id": run_id, "settings": dataclasses.asdict(settings), "model": identity,
+                   "watches": [{"module": str(w.module)[:512], "where": str(w.where)[:32]}
+                               if isinstance(w, WatchSpec) else {"invalid_type": type(w).__name__}
+                               for w in watches[:8]], "watches_requested": len(watches),
+                   "watch_budget": dataclasses.asdict(watch_budget) if isinstance(watch_budget, WatchBudget)
+                                   else {"invalid_type": type(watch_budget).__name__}, "captures": captures,
                    "timing": timing, "tokens": [], "candidates": [], "used": {}, **_bounded_prompt(prompt)}
 
         def fail(message: str, status: str, phase: str) -> RunFailed:
@@ -181,6 +190,11 @@ class TorchEngine:
         if full is None or tokenizer is None or torch is None:
             raise fail("This model can be inspected but not run: it has no next-token head or no tokenizer.",
                        "rejected", "setup")
+        try:
+            session = WatchSession(full.model if hasattr(full, "model") else full, watches,
+                                   watch_budget, run_id, torch, captures)
+        except ValueError as exc:
+            raise fail(str(exc), "rejected", "watch") from exc
         if not prompt:
             raise fail("Type a prompt to run.", "rejected", "input")
         if not 1 <= settings.top_k <= MAX_TOP_K:
@@ -224,8 +238,13 @@ class TorchEngine:
             raise fail("cancelled before the forward pass", "cancelled", "forward")
         t0 = time.monotonic()
         try:
-            with torch.inference_mode():
-                logits = full(**{k: v.to(device) for k, v in encoded.items()}, **forward_kwargs).logits
+            with self._run_lock:
+                if stop():
+                    raise fail("cancelled while waiting for the forward pass", "cancelled", "forward")
+                with torch.inference_mode(), session.attached(count):
+                    logits = full(**{k: v.to(device) for k, v in encoded.items()}, **forward_kwargs).logits
+        except RunFailed:
+            raise
         except Exception as exc:
             timing["forward"] = time.monotonic() - t0
             raise fail(f"forward failed: {exc}", "failed", "forward") from exc
@@ -266,7 +285,8 @@ class TorchEngine:
             "top_k": len(candidates),
         }
         result = RunResult(run_id=run_id, prompt=prompt, tokens=tokens, candidates=candidates,
-                           settings=settings, used=used, model=identity, timing=timing)
+                           settings=settings, used=used, model=identity, timing=timing,
+                           watches=watches, watch_budget=watch_budget, captures=tuple(captures))
         try:
             return dataclasses.replace(result, record_path=str(write_record(result)))
         except (OSError, ValueError) as exc:

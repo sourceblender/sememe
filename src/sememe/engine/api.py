@@ -151,6 +151,27 @@ class Candidate:
 
 
 @dataclass(frozen=True)
+class WatchSpec:
+    """Observe a module in model_info's namespace; no intervention."""
+
+    module: str
+    where: str = "output"  # input | output
+
+
+@dataclass(frozen=True)
+class WatchBudget:
+    """Hard-bounded summaries: first N tokens, at most one invocation per target.
+
+    A token exceeding max_features is skipped, never sampled silently. No raw
+    activations are retained. Limits may be lowered, not raised beyond defaults.
+    """
+
+    max_watches: int = 8
+    max_tokens: int = 128
+    max_features: int = 65536
+
+
+@dataclass(frozen=True)
 class RunResult:
     """One controlled forward pass: exact input, top next tokens, and how it ran.
 
@@ -167,6 +188,9 @@ class RunResult:
     used: dict[str, Any]
     model: dict[str, Any]  # identity of the loaded model: class, ref, config digest, versions
     timing: dict[str, float]  # seconds per stage
+    watches: tuple[WatchSpec, ...] = ()
+    watch_budget: WatchBudget = field(default_factory=WatchBudget)
+    captures: tuple[dict[str, Any], ...] = ()
     record_path: str | None = None  # None when nothing was saved; see record_error
     record_error: str | None = None  # why saving the record failed, if it did
 
@@ -211,8 +235,11 @@ class Engine(Protocol):
         ...
 
     def run(self, prompt: str, settings: RunSettings,
-            cancelled: Callable[[], bool] | None = None) -> RunResult:
+            cancelled: Callable[[], bool] | None = None, *,
+            watches: tuple[WatchSpec, ...] = (), watch_budget: WatchBudget = WatchBudget()) -> RunResult:
         """One forward pass over `prompt`, scored at the last position. Never
         generates. `cancelled` is checked at the run's boundaries only: a forward
-        already executing is not interrupted."""
+        already executing is not interrupted. Watches observe input/output module
+        boundaries in model_info paths. Captures report unsupported shapes and
+        budget limits explicitly; no raw tensors or interventions are supported."""
         ...
