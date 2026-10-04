@@ -173,8 +173,11 @@ class TorchEngine:
         captures: list[dict[str, Any]] = []
         timing: dict[str, float] = {}
         attempt = {"run_id": run_id, "settings": dataclasses.asdict(settings), "model": identity,
-                   "watches": [dataclasses.asdict(w) for w in watches[:8]], "watches_requested": len(watches),
-                   "watch_budget": dataclasses.asdict(watch_budget), "captures": captures,
+                   "watches": [{"module": str(w.module)[:512], "where": str(w.where)[:32]}
+                               if isinstance(w, WatchSpec) else {"invalid_type": type(w).__name__}
+                               for w in watches[:8]], "watches_requested": len(watches),
+                   "watch_budget": dataclasses.asdict(watch_budget) if isinstance(watch_budget, WatchBudget)
+                                   else {"invalid_type": type(watch_budget).__name__}, "captures": captures,
                    "timing": timing, "tokens": [], "candidates": [], "used": {}, **_bounded_prompt(prompt)}
 
         def fail(message: str, status: str, phase: str) -> RunFailed:

@@ -194,6 +194,17 @@ def test_real_qwen_scores_equal_and_summary_matches_direct_hook(tmp_path, monkey
     assert c['status'] == 'ok'
     last = c['summaries'][-1]
     assert (last['mean'], last['std'], last['l2_norm']) == reference[0]
+    # Decoder residual output feeds the next layer's hidden_states input.
+    for n in (1, 3):
+        previous = f'language_model.layers.{n-1}'
+        current = f'language_model.layers.{n}'
+        run = e.run('The capital of France is', RunSettings(),
+                    watches=(WatchSpec(previous), WatchSpec(current, 'input')))
+        before, after = run.captures
+        assert after['status'] == 'ok'
+        assert after['argument'] in ('args[0]', 'hidden_states')
+        assert after['summaries'] == before['summaries']
+        assert run.candidates == base.candidates
     assert_clean(e)
     e.close()
 
@@ -240,3 +251,31 @@ def test_preserves_existing_hooks_and_close_during_forward(engine):
     finally:
         external.remove()
     assert not module._forward_hooks
+
+
+@pytest.mark.parametrize('watches,budget', [((object(),), WatchBudget()), ((WatchSpec('node'),), object())])
+def test_malformed_spec_or_budget_is_recorded_rejection(engine, watches, budget):
+    with pytest.raises(RunFailed) as caught:
+        engine.run('x', RunSettings(), watches=watches, watch_budget=budget)
+    assert caught.value.status == 'rejected'
+    assert json.loads(Path(caught.value.record_path).read_text())['phase'] == 'watch'
+    assert engine._full.calls == 0
+
+
+def test_explicit_input_argument_ignores_masks(engine):
+    class WithAux(torch.nn.Module):
+        def forward(self, hidden_states, attention_mask=None, position_ids=None):
+            return hidden_states
+    engine._full.node = WithAux()
+    captures = []
+    s = WatchSession(engine._full, (WatchSpec('node', 'input'),), WatchBudget(), 'r', torch, captures)
+    x = torch.ones(1,3,2)
+    with s.attached(3):
+        engine._full.node(hidden_states=x, attention_mask=torch.ones(1,3), position_ids=torch.ones(1,3))
+    assert captures[0]['status'] == 'ok'
+    assert captures[0]['argument'] == 'hidden_states'
+    captures.clear()
+    with s.attached(3):
+        engine._full.node(x, torch.ones(1,3), torch.ones(1,3))
+    assert captures[0]['argument'] == 'args[0]'
+    assert_clean(engine)

@@ -22,9 +22,12 @@ watch list records its first eight specs and total requested count.
 
 Unknown paths, duplicate addresses, unsupported boundaries and invalid budgets
 reject the attempt before its forward. Runtime values which cannot be interpreted
-as a single token tensor carry an `unsupported` status and reason. Tuples/lists
-are accepted only when exactly one direct element is a tensor; mappings and
-ambiguous tuples are unsupported. Nonfinite elements produce counts and null
+as a single token tensor carry an `unsupported` status and reason. For inputs, the first positional tensor or the explicit `hidden_states`
+keyword is selected and recorded as `argument`; auxiliary masks and position
+ids are not activation candidates. Output tuples/lists are accepted only when
+exactly one direct element is a tensor; mappings and ambiguous tuples are
+unsupported. Embedding inputs are integer token IDs, so their input boundary
+is intentionally unsupported (the floating embedding output is supported). Nonfinite elements produce counts and null
 statistics, never invalid JSON; reduction overflow is also explicit. A target
 which was not called has `not_called` status.
 

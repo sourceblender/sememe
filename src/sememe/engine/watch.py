@@ -2,11 +2,17 @@
 from contextlib import contextmanager, ExitStack
 import time
 
-from .api import WatchBudget
+from .api import WatchBudget, WatchSpec
 
 
 class WatchSession:
     def __init__(self, model, specs, budget, run_id, torch, captures):
+        if not isinstance(budget, WatchBudget):
+            raise ValueError('watch_budget must be WatchBudget')
+        if any(not isinstance(spec, WatchSpec) for spec in specs):
+            raise ValueError('Every watch must be WatchSpec')
+        if any(not isinstance(spec.module, str) or len(spec.module) > 512 for spec in specs):
+            raise ValueError('Watch module must be a string of at most 512 characters')
         limits = WatchBudget()
         for name in ('max_watches', 'max_tokens', 'max_features'):
             value = getattr(budget, name)
@@ -14,6 +20,8 @@ class WatchSession:
                 raise ValueError(f'{name} must be an integer between 1 and {getattr(limits, name)}')
         if len(specs) > budget.max_watches:
             raise ValueError('Watch count exceeds max_watches')
+        if any(not isinstance(s.where, str) or s.where not in ('input', 'output') for s in specs):
+            raise ValueError('Unsupported watch boundary: expected input or output')
         addresses = [(s.module, s.where) for s in specs]
         if len(set(addresses)) != len(addresses):
             raise ValueError('Duplicate watch addresses')
@@ -50,9 +58,17 @@ class WatchSession:
                         observe(output)
                     handle = module.register_forward_hook(hook)
                 else:
-                    def hook(owner, args, kwargs, observe=observe):
-                        # One tensor among positional and keyword arguments only.
-                        observe((*args, *kwargs.values()))
+                    def hook(owner, args, kwargs, observe=observe, result=result):
+                        # The model's activation argument, not auxiliary masks/ids.
+                        # This does not infer a head axis or select arbitrary kwargs.
+                        if args and self.torch.is_tensor(args[0]):
+                            result['argument'] = 'args[0]'
+                            observe(args[0])
+                        elif self.torch.is_tensor(kwargs.get('hidden_states')):
+                            result['argument'] = 'hidden_states'
+                            observe(kwargs['hidden_states'])
+                        else:
+                            observe(None)
                     handle = module.register_forward_pre_hook(hook, with_kwargs=True)
                 stack.callback(handle.remove)
             yield
