@@ -196,3 +196,47 @@ def test_real_qwen_scores_equal_and_summary_matches_direct_hook(tmp_path, monkey
     assert (last['mean'], last['std'], last['l2_norm']) == reference[0]
     assert_clean(e)
     e.close()
+
+
+def test_waiting_cancel_does_not_forward_or_attach(engine):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    ready, cancel = threading.Event(), threading.Event()
+    engine._run_lock.acquire()
+    def stop():
+        ready.set()
+        return cancel.is_set()
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            job = pool.submit(engine.run, 'x', RunSettings(), stop, watches=(WatchSpec('node'),))
+            assert ready.wait(5)
+            cancel.set()
+            engine._run_lock.release()
+            with pytest.raises(RunFailed) as caught:
+                job.result()
+    finally:
+        if engine._run_lock.locked():
+            engine._run_lock.release()
+    assert caught.value.status == 'cancelled'
+    assert engine._full.calls == 0
+    assert_clean(engine)
+
+
+def test_preserves_existing_hooks_and_close_during_forward(engine):
+    module = engine._full.node
+    calls = []
+    external = module.register_forward_hook(lambda *args: calls.append(True))
+    model = engine._full
+    original = model.forward
+    def closing(*args, **kwargs):
+        engine.close()
+        return original(*args, **kwargs)
+    model.forward = closing
+    try:
+        r = engine.run('x', RunSettings(), watches=(WatchSpec('node'),))
+        assert r.captures[0]['status'] == 'ok'
+        assert len(module._forward_hooks) == 1
+        assert calls == [True]
+    finally:
+        external.remove()
+    assert not module._forward_hooks
